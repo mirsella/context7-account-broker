@@ -4,7 +4,7 @@
   "description": "Quota-aware Context7 MCP broker with multi-account routing, caching, affinity, and failover.",
   "license": "MIT",
   "type": "module",
-  "packageManager": "pnpm@11.3.0",
+  "packageManager": "pnpm@10.14.0",
   "repository": {
     "type": "git",
     "url": "https://github.com/mirsella/context7-account-broker.git"
