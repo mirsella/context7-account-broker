@@ -1,7 +1,7 @@
 {
   "name": "@mirsella/context7-account-broker",
   "version": "0.1.0",
-  "description": "A local MCP proxy that routes Context7 calls across authorized API keys.",
+  "description": "Quota-aware Context7 MCP broker with multi-account routing, caching, affinity, and failover.",
   "license": "MIT",
   "type": "module",
   "repository": {
