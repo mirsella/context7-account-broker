@@ -42,6 +42,7 @@ Configure the MCP server in `~/.config/opencode/opencode.jsonc`:
 "context7": {
   "type": "local",
   "command": ["npx", "-y", "git+https://github.com/mirsella/context7-account-broker.git"],
+  "environment": { "npm_config_allow_git": "all" },
   "timeout": 30000,
   "enabled": true
 }
@@ -56,23 +57,23 @@ replace the command below with `npx -y /home/mirsella/dev/context7-account-broke
 
 ```bash
 # Add a named account using a hidden API-key prompt
-npx -y git+https://github.com/mirsella/context7-account-broker.git accounts add personal
+npm_config_allow_git=all npx -y git+https://github.com/mirsella/context7-account-broker.git accounts add personal
 
 # Non-interactive input for scripts
 printf '%s\n' "$CONTEXT7_API_KEY" |
-  npx -y git+https://github.com/mirsella/context7-account-broker.git accounts add personal
+  npm_config_allow_git=all npx -y git+https://github.com/mirsella/context7-account-broker.git accounts add personal
 
 # Show names, credential sources, and non-secret fingerprints
-npx -y git+https://github.com/mirsella/context7-account-broker.git accounts list
+npm_config_allow_git=all npx -y git+https://github.com/mirsella/context7-account-broker.git accounts list
 
 # Fetch authoritative quota usage and reset dates
-npx -y git+https://github.com/mirsella/context7-account-broker.git status
+npm_config_allow_git=all npx -y git+https://github.com/mirsella/context7-account-broker.git status
 
 # Remove a file-configured account
-npx -y git+https://github.com/mirsella/context7-account-broker.git accounts remove personal
+npm_config_allow_git=all npx -y git+https://github.com/mirsella/context7-account-broker.git accounts remove personal
 
 # Show effective configuration and storage paths
-npx -y git+https://github.com/mirsella/context7-account-broker.git config
+npm_config_allow_git=all npx -y git+https://github.com/mirsella/context7-account-broker.git config
 ```
 
 `status` consumes one Context7 request per account because Context7 attaches
