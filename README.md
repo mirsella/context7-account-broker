@@ -35,18 +35,14 @@ without changing tool schemas or results.
 The command prompts for the API key without displaying it:
 
 ```bash
-npm_config_allow_git=all npx -y \
-  git+https://github.com/mirsella/context7-account-broker.git \
-  accounts add personal
+npx -y @mirsella/context7-account-broker accounts add personal
 ```
 
 Repeat the command with a different name for each account. To verify the saved
 accounts without exposing their keys:
 
 ```bash
-npm_config_allow_git=all npx -y \
-  git+https://github.com/mirsella/context7-account-broker.git \
-  accounts list
+npx -y @mirsella/context7-account-broker accounts list
 ```
 
 ### 2. Configure OpenCode
@@ -58,14 +54,7 @@ Add the server to `~/.config/opencode/opencode.jsonc`:
   "mcp": {
     "context7": {
       "type": "local",
-      "command": [
-        "npx",
-        "-y",
-        "git+https://github.com/mirsella/context7-account-broker.git"
-      ],
-      "environment": {
-        "npm_config_allow_git": "all"
-      },
+      "command": ["npx", "-y", "@mirsella/context7-account-broker"],
       "timeout": 30000,
       "enabled": true
     }
@@ -79,12 +68,11 @@ Restart OpenCode, then check the connection:
 opencode mcp list
 ```
 
-`npm_config_allow_git=all` is required by npm 12, which blocks Git package
-sources by default. It permits the GitHub package used by this MCP entry.
+The package is published to npm, so no Git checkout or local build is required.
 
 ## CLI
 
-The examples below use the GitHub version directly.
+The examples below use the published npm package.
 
 | Command | Purpose |
 | --- | --- |
@@ -99,18 +87,19 @@ The examples below use the GitHub version directly.
 For example:
 
 ```bash
-REPO=git+https://github.com/mirsella/context7-account-broker.git
+BROKER=@mirsella/context7-account-broker
 
-npm_config_allow_git=all npx -y "$REPO" status
-npm_config_allow_git=all npx -y "$REPO" config
-npm_config_allow_git=all npx -y "$REPO" accounts remove personal
+npx -y "$BROKER" status
+npx -y "$BROKER" config
+npx -y "$BROKER" accounts remove personal
 ```
 
 For non-interactive account setup:
 
 ```bash
+BROKER=@mirsella/context7-account-broker
 printf '%s\n' "$CONTEXT7_API_KEY" |
-  npm_config_allow_git=all npx -y "$REPO" accounts add personal
+  npx -y "$BROKER" accounts add personal
 ```
 
 ## Account selection
