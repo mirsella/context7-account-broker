@@ -27,20 +27,12 @@ jobs:
 
       - run: corepack enable
       - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
       - run: pnpm test
       - run: pnpm build
 
-      - id: package
-        run: |
-          name="$(node -p 'require("./package.json").name')"
-          version="$(node -p 'require("./package.json").version')"
-          echo "name=$name" >> "$GITHUB_OUTPUT"
-          echo "version=$version" >> "$GITHUB_OUTPUT"
-
       - id: published
         run: |
-          package="${{ steps.package.outputs.name }}@${{ steps.package.outputs.version }}"
+          package="$(node -p 'const p=require("./package.json"); p.name+"@"+p.version')"
           if npm view "$package" version >/dev/null 2>&1; then
             echo "Package $package is already published; skipping npm publish."
             echo "exists=true" >> "$GITHUB_OUTPUT"

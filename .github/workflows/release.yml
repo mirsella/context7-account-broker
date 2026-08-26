@@ -34,19 +34,4 @@ jobs:
             exit 1
           fi
 
-          previous_tag="$(git describe --tags --abbrev=0 --match 'v*' 2>/dev/null || true)"
-
-          {
-            echo "Release $tag."
-            echo
-            echo "## Commits"
-            echo
-            if [ -n "$previous_tag" ]; then
-              git log --pretty=format:'- %h %s' "$previous_tag..HEAD"
-            else
-              git log --pretty=format:'- %h %s'
-            fi
-            echo
-          } > release-notes.md
-
-          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --notes-file release-notes.md
+          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --generate-notes
