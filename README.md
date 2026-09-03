@@ -47,6 +47,14 @@ context7-account-broker config
 
 Use `bunx @mirsella/context7-account-broker ...` when the package is not otherwise installed.
 
+### Check account quotas
+
+```sh
+bunx @mirsella/context7-account-broker status
+```
+
+The command prints each account's used and total requests, percentage used, blocked state, and UTC reset time. It makes one Context7 request per configured account to read the current quota headers; the broker does not probe quotas in the background.
+
 ## Architecture
 
 The plugin contains a static `x86_64-unknown-linux-musl` binary. One current-thread Tokio process exposes authenticated Streamable HTTP MCP on loopback. It forwards requests directly to the official Context7 REST API with bounded concurrency four.

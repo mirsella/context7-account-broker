@@ -1,6 +1,6 @@
 [package]
 name = "context7-account-broker"
-version = "0.2.1"
+version = "0.2.2"
 edition = "2024"
 license = "MIT"
 description = "Linux x64 Context7 MCP broker with multi-account routing, caching, affinity, and failover."
