@@ -1,7 +1,7 @@
 {
   "name": "@mirsella/context7-account-broker",
-  "version": "0.2.0",
-  "description": "Seamless multi-account Context7 plugin for OpenCode",
+  "version": "0.2.1",
+  "description": "Linux x64 multi-account Context7 plugin for OpenCode",
   "type": "module",
   "exports": {
     "./server": "./plugin/context7.ts"

@@ -2,6 +2,9 @@
 
 An OpenCode plugin that runs one local Context7 MCP broker across projects and shares quota, caching, affinity, and in-flight requests across configured API keys.
 
+> [!IMPORTANT]
+> This package supports Linux x86-64 only. macOS, Windows, Linux ARM64, and other platforms are not supported.
+
 ## Setup
 
 Add at least one Context7 account:
@@ -57,8 +60,6 @@ Default private state:
 - Cache and launch log: `$XDG_CACHE_HOME/context7-account-broker/`
 
 Optional environment settings are `CONTEXT7_BROKER_CONFIG`, `CONTEXT7_API_KEY`, `CONTEXT7_API_KEYS`, `CONTEXT7_BROKER_INCLUDE_ENV`, `CONTEXT7_BROKER_TOKEN_FILE`, `CONTEXT7_CACHE_DIR`, `CONTEXT7_CACHE_TTL_DAYS`, `CONTEXT7_ACCOUNT_COOLDOWN_MS`, and `CONTEXT7_BROKER_PORT`.
-
-The package supports Linux x64 only.
 
 ## License
 
