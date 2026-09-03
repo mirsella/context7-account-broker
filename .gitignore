@@ -1,7 +1,8 @@
-node_modules/
-dist/
+/target/
+/node_modules/
 *.log
 .env
 .env.*
 !.env.example
 *.tgz
+/vendor/context7-account-broker

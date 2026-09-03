@@ -1,0 +1,27 @@
+[package]
+name = "context7-account-broker"
+version = "0.2.0"
+edition = "2024"
+license = "MIT"
+description = "Quota-aware Context7 MCP broker with multi-account routing, caching, affinity, and failover."
+
+[dependencies]
+axum = "0.8"
+futures = "0.3"
+reqwest = { version = "0.13", default-features = false, features = ["query", "rustls"] }
+rpassword = "7"
+rmcp = { version = "3.2.0", default-features = false, features = ["macros", "server", "transport-streamable-http-server"] }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.11"
+tokio = { version = "1", features = ["macros", "net", "rt", "signal", "sync", "time"] }
+tokio-util = { version = "0.7", features = ["rt"] }
+
+[dev-dependencies]
+tempfile = "3"
+
+[profile.release]
+codegen-units = 1
+lto = true
+opt-level = "s"
+strip = true

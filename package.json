@@ -1,46 +1,53 @@
 {
   "name": "@mirsella/context7-account-broker",
-  "version": "0.1.0",
-  "description": "Quota-aware Context7 MCP broker with multi-account routing, caching, affinity, and failover.",
-  "license": "MIT",
+  "version": "0.2.0",
+  "description": "Seamless multi-account Context7 plugin for OpenCode",
   "type": "module",
-  "packageManager": "pnpm@10.14.0",
-  "repository": {
-    "type": "git",
-    "url": "git+https://github.com/mirsella/context7-account-broker.git"
-  },
-  "bugs": {
-    "url": "https://github.com/mirsella/context7-account-broker/issues"
-  },
-  "homepage": "https://github.com/mirsella/context7-account-broker#readme",
-  "engines": {
-    "node": ">=20"
+  "exports": {
+    "./server": "./plugin/context7.ts"
   },
   "bin": {
-    "context7-account-broker": "dist/index.js"
+    "context7-account-broker": "vendor/context7-account-broker"
   },
   "files": [
-    "dist",
+    "plugin/",
+    "vendor/",
     "README.md",
     "LICENSE"
   ],
   "scripts": {
-    "build": "tsc",
-    "start": "node dist/index.js",
-    "test": "vitest run",
-    "typecheck": "tsc --noEmit",
-    "prepare": "tsc"
+    "build:native": "cargo build --locked --release --target x86_64-unknown-linux-musl",
+    "stage:native": "node scripts/stage-native.mjs",
+    "test": "cargo test --locked && bun test tests/plugin.test.ts",
+    "prepack": "pnpm build:native && pnpm stage:native"
+  },
+  "keywords": [
+    "opencode",
+    "context7",
+    "mcp"
+  ],
+  "homepage": "https://github.com/mirsella/context7-account-broker#readme",
+  "bugs": "https://github.com/mirsella/context7-account-broker/issues",
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/mirsella/context7-account-broker.git"
+  },
+  "license": "MIT",
+  "author": "mirsella",
+  "os": [
+    "linux"
+  ],
+  "cpu": [
+    "x64"
+  ],
+  "engines": {
+    "opencode": ">=1.18.0"
+  },
+  "packageManager": "pnpm@10.14.0",
+  "devDependencies": {
+    "@opencode-ai/plugin": "1.18.11"
   },
   "publishConfig": {
     "access": "public"
-  },
-  "dependencies": {
-    "@modelcontextprotocol/client": "2.0.0",
-    "@modelcontextprotocol/server": "2.0.0"
-  },
-  "devDependencies": {
-    "@types/node": "^25.0.3",
-    "typescript": "^5.8.2",
-    "vitest": "^4.1.9"
   }
 }

@@ -2,9 +2,6 @@
 
 ## Deployment
 
-- npm publishing is handled by GitHub Actions in `.github/workflows/publish.yml`.
-- The `release` workflow creates a GitHub release from the version in `package.json`:
-  `gh workflow run release.yml`
-- Publishing runs automatically when that GitHub release is published.
-- Manual publish runs default to a dry run; use `gh workflow run publish.yml -f dry_run=false` to publish.
-- npm trusted publishing uses GitHub OIDC. Do not add npm tokens to the repository or workflow.
+- The release workflow tests and packages the static Rust binary, creates the GitHub release, and publishes the npm package.
+- Do not commit credentials, server tokens, or API keys.
+- The OpenCode plugin starts and configures the broker. Do not add a separate service-manager setup.

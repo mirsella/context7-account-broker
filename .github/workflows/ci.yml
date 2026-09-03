@@ -13,11 +13,25 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v7
-      - uses: actions/setup-node@v7
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          node-version: 20
-      - run: corepack enable
+          components: rustfmt, clippy
+          targets: x86_64-unknown-linux-musl
+      - uses: Swatinem/rust-cache@v2
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.14.0
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 24
+          cache: pnpm
+      - uses: oven-sh/setup-bun@v2
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: pnpm install --frozen-lockfile
-      - run: pnpm typecheck
-      - run: pnpm test
-      - run: pnpm build
+      - run: cargo fmt --check
+      - run: cargo test --locked
+      - run: cargo clippy --locked --all-targets -- -D warnings
+      - run: bun test tests/plugin.test.ts
+      - run: test "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')" = "$(node -p "require('./package.json').version")"
+      - run: pnpm build:native && pnpm stage:native
+      - run: npm pack --dry-run --ignore-scripts

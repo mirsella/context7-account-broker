@@ -8,30 +8,71 @@ jobs:
     runs-on: ubuntu-latest
     permissions:
       contents: write
+      id-token: write
     steps:
       - uses: actions/checkout@v6
+
+      - uses: dtolnay/rust-toolchain@stable
         with:
-          fetch-depth: 0
+          targets: x86_64-unknown-linux-musl
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10.14.0
 
       - uses: actions/setup-node@v6
         with:
           node-version: 24
+          registry-url: https://registry.npmjs.org
+          package-manager-cache: false
 
-      - name: Create GitHub release
+      - uses: oven-sh/setup-bun@v2
+
+      - run: sudo apt-get update && sudo apt-get install -y musl-tools
+
+      - run: pnpm install --frozen-lockfile
+
+      - name: Verify package
+        run: |
+          test "$(node -p "require('./package.json').version")" = "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          pnpm test
+
+      - name: Build and package release
+        run: |
+          pnpm build:native
+          pnpm stage:native
+          npm pack --ignore-scripts
+
+      - name: Prepare Linux x86_64 assets
+        run: |
+          asset="context7-account-broker-linux-x86_64"
+          cp vendor/context7-account-broker "$asset"
+          sha256sum "$asset" > "$asset.sha256"
+
+      - name: Create or refresh GitHub release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          version="$(node -p 'require("./package.json").version')"
+          version="$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
           tag="v${version}"
 
           if gh release view "$tag" >/dev/null 2>&1; then
-            echo "::error::Release $tag already exists"
-            exit 1
+            gh release upload "$tag" --clobber \
+              context7-account-broker-linux-x86_64 \
+              context7-account-broker-linux-x86_64.sha256 \
+              mirsella-context7-account-broker-*.tgz
+          else
+            gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --generate-notes \
+              context7-account-broker-linux-x86_64 \
+              context7-account-broker-linux-x86_64.sha256 \
+              mirsella-context7-account-broker-*.tgz
           fi
 
-          if git rev-parse --verify --quiet "refs/tags/$tag" >/dev/null; then
-            echo "::error::Tag $tag already exists"
-            exit 1
+      - name: Publish npm package
+        run: |
+          version="$(node -p "require('./package.json').version")"
+          if npm view "@mirsella/context7-account-broker@$version" version >/dev/null 2>&1; then
+            echo "@mirsella/context7-account-broker@$version is already published"
+          else
+            npm publish --access public --provenance --ignore-scripts
           fi
-
-          gh release create "$tag" --target "$GITHUB_SHA" --title "$tag" --generate-notes

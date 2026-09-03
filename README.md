@@ -1,216 +1,65 @@
-# Context7 Account Broker
+# context7-account-broker
 
-[![CI](https://github.com/mirsella/context7-account-broker/actions/workflows/ci.yml/badge.svg)](https://github.com/mirsella/context7-account-broker/actions/workflows/ci.yml)
-[![Node.js 20+](https://img.shields.io/badge/Node.js-20%2B-339933?logo=node.js&logoColor=white)](https://nodejs.org/)
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+An OpenCode plugin that runs one local Context7 MCP broker across projects and shares quota, caching, affinity, and in-flight requests across configured API keys.
 
-A drop-in Context7 MCP proxy for people who use more than one authorized API
-key. It balances requests by quota usage, keeps each library on the same account,
-and caches successful responses on disk.
+## Setup
 
-OpenCode sees the standard Context7 tools:
+Add at least one Context7 account:
 
-- `resolve-library-id`
-- `query-docs`
-
-The broker handles account selection, failover, caching, and quota refreshes
-without changing tool schemas or results.
-
-## What it does
-
-- Routes new work to the account with the lowest proportional quota usage.
-- Keeps a library on the same account within each project.
-- Fails over when an account is blocked, rate limited, unauthorized, or
-  temporarily unreachable.
-- Reads Context7's `RateLimit-*` headers instead of estimating quota locally.
-- Caches exact successful calls for 30 days by default.
-- Coalesces concurrent identical requests into one upstream call.
-- Stores named credentials in a private `0600` configuration file.
-- Provides CLI commands for account management, quota status, and diagnostics.
-
-## Quick start
-
-### 1. Add your Context7 accounts
-
-The command prompts for the API key without displaying it:
-
-```bash
-npx -y @mirsella/context7-account-broker accounts add personal
+```sh
+bunx @mirsella/context7-account-broker accounts add personal
 ```
 
-Repeat the command with a different name for each account. To verify the saved
-accounts without exposing their keys:
+The command reads the API key from a hidden terminal prompt and stores it in a private `accounts.json` file.
 
-```bash
-npx -y @mirsella/context7-account-broker accounts list
-```
+Then add the plugin to `opencode.json`:
 
-### 2. Configure OpenCode
-
-Add the server to `~/.config/opencode/opencode.jsonc`:
-
-```jsonc
+```json
 {
-  "mcp": {
-    "context7": {
-      "type": "local",
-      "command": ["npx", "-y", "@mirsella/context7-account-broker"],
-      "timeout": 30000,
-      "enabled": true
-    }
-  }
+  "plugin": ["@mirsella/context7-account-broker"]
 }
 ```
 
-Restart OpenCode, then check the connection:
+That is the complete OpenCode configuration. Do not add an `mcp.context7-broker` entry: the plugin creates it and refuses to replace an existing entry.
 
-```bash
-opencode mcp list
-```
+## Lifecycle
 
-The package is published to npm, so no Git checkout or local build is required.
+When OpenCode loads the plugin, the packaged Linux x64 binary runs `start`. It creates a private server token if needed, reuses an authenticated healthy broker on `127.0.0.1:14197`, or launches the shared broker and waits briefly for readiness. The plugin reads the token into OpenCode's in-memory MCP configuration; it never writes the token to `opencode.json` or passes it in process arguments.
 
-## CLI
+The broker stays available across project and session lifetimes. Its containing process manager may stop it with OpenCode; a later plugin launch reuses it when healthy or starts a replacement when it is absent. There is no supervisor, heartbeat, separate systemd unit, PATH installation, manual token, or last-client shutdown.
 
-The examples below use the published npm package.
+Startup makes no Context7 requests. Context7 is contacted only for tool calls and the explicit `status` command.
 
-| Command | Purpose |
-| --- | --- |
-| `accounts add [name]` | Add a named API key using a hidden prompt or stdin |
-| `accounts list` | List account names, sources, and key fingerprints |
-| `accounts remove <name>` | Remove a file-configured account |
-| `status` | Fetch current quota usage and reset times |
-| `config` | Print effective paths and runtime settings |
-| `help` | Show command help |
-| `serve` | Start the stdio MCP server (the default) |
-
-For example:
-
-```bash
-BROKER=@mirsella/context7-account-broker
-
-npx -y "$BROKER" status
-npx -y "$BROKER" config
-npx -y "$BROKER" accounts remove personal
-```
-
-For non-interactive account setup:
-
-```bash
-BROKER=@mirsella/context7-account-broker
-printf '%s\n' "$CONTEXT7_API_KEY" |
-  npx -y "$BROKER" accounts add personal
-```
-
-## Account selection
-
-At startup, the broker probes each key and reads Context7's authoritative
-`RateLimit-Limit`, `RateLimit-Remaining`, and `RateLimit-Reset` headers.
-
-For a library without an existing assignment, it chooses the available account
-with the lowest proportional usage:
+## Commands
 
 ```text
-used / limit = (limit - remaining) / limit
+context7-account-broker start
+context7-account-broker serve
+context7-account-broker accounts list
+context7-account-broker accounts add NAME
+context7-account-broker accounts remove NAME
+context7-account-broker status
+context7-account-broker config
 ```
 
-Equal accounts rotate in round-robin order. Once selected, the account is saved
-as the preferred account for that library and project. A temporary failure can
-move one request elsewhere without discarding the preference.
+Use `bunx @mirsella/context7-account-broker ...` when the package is not otherwise installed.
 
-Blocked accounts are checked again at their reset time. Free-plan accounts are
-also checked at the next UTC day so Context7's daily bonus calls can become
-available.
+## Architecture
 
-## Cache
+The plugin contains a static `x86_64-unknown-linux-musl` binary. One current-thread Tokio process exposes authenticated Streamable HTTP MCP on loopback. It forwards requests directly to the official Context7 REST API with bounded concurrency four.
 
-Successful tool results are cached by:
+The broker provides the canonical `resolve-library-id` and `query-docs` tools. It routes toward account affinity and lower quota use, rotates unknown quota fairly, fails over account-specific `401`, `403`, and `429` responses, and caps shared endpoint failures at two attempts. Successful results use an account-partitioned disk cache. Identical typed requests share one cancellation-safe in-flight producer.
 
-- project scope
-- tool name
-- canonicalized arguments
-- API-key hash
+Default private state:
 
-The API-key partition prevents a removed account from serving its cached private
-content. Expired files are removed on startup and lazily when read. Concurrent
-identical calls share one in-flight request.
+- Accounts: `$XDG_CONFIG_HOME/context7-account-broker/accounts.json`
+- Server token: `$XDG_CONFIG_HOME/context7-account-broker/server-token`
+- Cache and launch log: `$XDG_CACHE_HOME/context7-account-broker/`
 
-The default cache directory is:
+Optional environment settings are `CONTEXT7_BROKER_CONFIG`, `CONTEXT7_API_KEY`, `CONTEXT7_API_KEYS`, `CONTEXT7_BROKER_INCLUDE_ENV`, `CONTEXT7_BROKER_TOKEN_FILE`, `CONTEXT7_CACHE_DIR`, `CONTEXT7_CACHE_TTL_DAYS`, `CONTEXT7_ACCOUNT_COOLDOWN_MS`, and `CONTEXT7_BROKER_PORT`.
 
-```text
-~/.cache/context7-account-broker
-```
-
-Delete that directory to invalidate all cached results and affinities.
-
-## Credentials
-
-Named accounts are stored at:
-
-```text
-~/.config/context7-account-broker/accounts.json
-```
-
-The directory uses mode `0700` and the file uses mode `0600`.
-
-When this file contains accounts, it acts as an allowlist. Inherited
-`CONTEXT7_API_KEY` and `CONTEXT7_API_KEYS` values are ignored unless
-`CONTEXT7_BROKER_INCLUDE_ENV=1` is set. This prevents an unrelated shell key from
-silently joining a configured pool.
-
-With no configured account file, the broker accepts:
-
-```bash
-export CONTEXT7_API_KEYS='ctx7sk_first,ctx7sk_second'
-```
-
-## Configuration
-
-| Environment variable | Default | Description |
-| --- | --- | --- |
-| `CONTEXT7_API_KEY` | unset | One API key when no account file is configured |
-| `CONTEXT7_API_KEYS` | unset | Separated API keys |
-| `CONTEXT7_BROKER_CONFIG` | XDG config path | Override the accounts file path |
-| `CONTEXT7_BROKER_INCLUDE_ENV` | unset | Include environment keys with `1` |
-| `CONTEXT7_MCP_URL` | `https://mcp.context7.com/mcp` | Upstream MCP endpoint |
-| `CONTEXT7_ACCOUNT_COOLDOWN_MS` | `30000` | Transient failure cooldown |
-| `CONTEXT7_CACHE_TTL_DAYS` | `30` | Result and affinity cache lifetime |
-| `CONTEXT7_CACHE_DIR` | XDG cache path | Override the cache directory |
-| `CONTEXT7_PROJECT_ID` | current directory | Cache and affinity scope |
-
-## Quota cost
-
-Context7 attaches quota state to normal API responses rather than exposing a
-free status endpoint. Each startup probe, refresh, and `status` check consumes
-one API request per checked account.
-
-## Development
-
-Requirements: Node.js 20 or newer and pnpm.
-
-```bash
-git clone https://github.com/mirsella/context7-account-broker.git
-cd context7-account-broker
-pnpm install
-pnpm typecheck
-pnpm test
-pnpm build
-```
-
-Run the local binary:
-
-```bash
-node dist/index.js accounts list
-node dist/index.js status
-node dist/index.js serve
-```
-
-## Responsible use
-
-Use API keys only for accounts you own or are authorized to aggregate. Follow
-Context7's terms and plan limits. The broker does not create accounts, bypass
-authentication, or hide upstream failures.
+The package supports Linux x64 only.
 
 ## License
 
-[MIT](LICENSE)
+MIT
