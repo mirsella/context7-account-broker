@@ -27,7 +27,7 @@ That is the complete OpenCode configuration. Do not add an `mcp.context7-broker`
 
 ## Lifecycle
 
-When OpenCode loads the plugin, the packaged Linux x64 binary runs `start`. It creates a private server token if needed, reuses an authenticated healthy broker on `127.0.0.1:14197`, or launches the shared broker and waits briefly for readiness. The plugin reads the token into OpenCode's in-memory MCP configuration; it never writes the token to `opencode.json` or passes it in process arguments.
+When OpenCode loads the plugin, the packaged Linux x64 binary runs `start`. It creates a private server token if needed, reuses an authenticated healthy broker on `127.0.0.1:14197`, or launches one when absent. The plugin reads the token into OpenCode's in-memory MCP configuration; it never writes the token to `opencode.json` or passes it in process arguments.
 
 The broker stays available across project and session lifetimes. Its containing process manager may stop it with OpenCode; a later plugin launch reuses it when healthy or starts a replacement when it is absent. There is no supervisor, heartbeat, separate systemd unit, PATH installation, manual token, or last-client shutdown.
 
@@ -63,11 +63,9 @@ The broker provides the canonical `resolve-library-id` and `query-docs` tools. I
 
 Default private state:
 
-- Accounts: `$XDG_CONFIG_HOME/context7-account-broker/accounts.json`
-- Server token: `$XDG_CONFIG_HOME/context7-account-broker/server-token`
-- Cache and launch log: `$XDG_CACHE_HOME/context7-account-broker/`
-
-Optional environment settings are `CONTEXT7_BROKER_CONFIG`, `CONTEXT7_API_KEY`, `CONTEXT7_API_KEYS`, `CONTEXT7_BROKER_INCLUDE_ENV`, `CONTEXT7_BROKER_TOKEN_FILE`, `CONTEXT7_CACHE_DIR`, `CONTEXT7_CACHE_TTL_DAYS`, `CONTEXT7_ACCOUNT_COOLDOWN_MS`, and `CONTEXT7_BROKER_PORT`.
+- Accounts: `${XDG_CONFIG_HOME:-$HOME/.config}/context7-account-broker/accounts.json`
+- Server token: `${XDG_CONFIG_HOME:-$HOME/.config}/context7-account-broker/server-token`
+- Cache and launch log: `${XDG_CACHE_HOME:-$HOME/.cache}/context7-account-broker/`
 
 ## License
 

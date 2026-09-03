@@ -29,9 +29,8 @@ jobs:
       - run: sudo apt-get update && sudo apt-get install -y musl-tools
       - run: pnpm install --frozen-lockfile
       - run: cargo fmt --check
-      - run: cargo test --locked
+      - run: pnpm test
       - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: bun test tests/plugin.test.ts
       - run: test "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')" = "$(node -p "require('./package.json').version")"
       - run: pnpm build:native && pnpm stage:native
       - run: npm pack --dry-run --ignore-scripts

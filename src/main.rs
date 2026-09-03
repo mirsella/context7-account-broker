@@ -33,6 +33,7 @@ use tokio_util::sync::CancellationToken;
 
 const STARTUP_DEADLINE: Duration = Duration::from_secs(5);
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(250);
+const PORT: u16 = 14197;
 
 #[derive(Serialize)]
 struct StartOutput {
@@ -174,24 +175,18 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn serve() -> Result<(), Box<dyn Error>> {
-    let settings = config::settings()?;
-    let token = config::read_server_token(&settings.token_path)?;
+    let token_path = config::token_path()?;
+    let token = config::read_server_token(&token_path)?;
     let authorization = HeaderValue::from_str(&format!("Bearer {token}"))?;
-    let accounts = config::load_accounts(&settings.accounts_path)?;
+    let address = SocketAddr::from(([127, 0, 0, 1], PORT));
+    let listener = tokio::net::TcpListener::bind(address).await?;
+    let accounts = config::load_accounts(&config::accounts_path()?)?;
     if accounts.is_empty() {
-        return Err("No accounts configured. Run accounts add or set CONTEXT7_API_KEYS".into());
+        return Err("No accounts configured. Run accounts add".into());
     }
-    let broker = Broker::new(
-        accounts,
-        Context7::new()?,
-        &settings.cache_path,
-        settings.cache_ttl,
-        settings.cooldown,
-    )?;
+    let broker = Broker::new(accounts, Context7::new()?, config::cache_path()?)?;
     let cancellation = CancellationToken::new();
     let app = application(broker, authorization, cancellation.clone());
-    let address = SocketAddr::from(([127, 0, 0, 1], settings.port));
-    let listener = tokio::net::TcpListener::bind(address).await?;
     eprintln!("context7-account-broker listening on http://{address}");
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let shutdown = cancellation.clone();
@@ -237,15 +232,15 @@ fn application(
 }
 
 async fn start() -> Result<(), Box<dyn Error>> {
-    let settings = config::settings()?;
-    let token = config::ensure_server_token(&settings.token_path)?;
-    let token_path = fs::canonicalize(&settings.token_path)?;
+    let token_path = config::token_path()?;
+    let token = config::ensure_server_token(&token_path)?;
+    let token_path = fs::canonicalize(token_path)?;
     let token_file = token_path
         .to_str()
         .ok_or("server token path must be valid Unicode")?
         .to_owned();
-    let url = format!("http://127.0.0.1:{}/mcp", settings.port);
-    let health_url = format!("http://127.0.0.1:{}/health", settings.port);
+    let url = format!("http://127.0.0.1:{PORT}/mcp");
+    let health_url = format!("http://127.0.0.1:{PORT}/health");
     let client = Client::builder().timeout(HEALTH_TIMEOUT).build()?;
     if broker_healthy(&client, &health_url, &token).await {
         println!(
@@ -255,8 +250,9 @@ async fn start() -> Result<(), Box<dyn Error>> {
         return Ok(());
     }
 
-    config::ensure_private_directory(&settings.cache_path)?;
-    let log_path = settings.cache_path.join("broker.stderr.log");
+    let cache_path = config::cache_path()?;
+    config::ensure_private_directory(&cache_path)?;
+    let log_path = cache_path.join("broker.stderr.log");
     config::write_private(&log_path, b"")?;
     let log = fs::OpenOptions::new().append(true).open(&log_path)?;
     let mut command = Command::new(std::env::current_exe()?);
@@ -268,8 +264,8 @@ async fn start() -> Result<(), Box<dyn Error>> {
         .process_group(0);
     let mut child = command.spawn()?;
     let deadline = tokio::time::Instant::now() + STARTUP_DEADLINE;
-    let mut exit = None;
     loop {
+        let child_status = child.try_wait()?;
         if broker_healthy(&client, &health_url, &token).await {
             println!(
                 "{}",
@@ -277,31 +273,37 @@ async fn start() -> Result<(), Box<dyn Error>> {
             );
             return Ok(());
         }
-        if exit.is_none() {
-            exit = child.try_wait()?;
+        if let Some(status) = child_status
+            && tokio::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], PORT)))
+                .await
+                .is_err()
+        {
+            return Err(startup_error(&log_path, format!("child exited with {status}")).into());
         }
         if tokio::time::Instant::now() >= deadline {
-            if exit.is_none() {
-                let _ = child.kill();
-                let _ = child.wait();
-            }
-            let detail = fs::read_to_string(&log_path).unwrap_or_default();
-            let status = exit
-                .map(|status| format!("child exited with {status}"))
-                .unwrap_or_else(|| "child did not become ready".to_owned());
-            return Err(format!(
-                "Context7 broker startup failed: {status}; log: {}{}",
-                log_path.display(),
-                if detail.trim().is_empty() {
-                    String::new()
-                } else {
-                    format!("\n{}", detail.trim())
-                }
-            )
-            .into());
+            let _ = child.kill();
+            let _ = child.wait();
+            let detail = child_status.map_or_else(
+                || "child did not become ready".to_owned(),
+                |status| format!("child exited with {status}"),
+            );
+            return Err(startup_error(&log_path, detail).into());
         }
         tokio::time::sleep(Duration::from_millis(50)).await;
     }
+}
+
+fn startup_error(log_path: &std::path::Path, status: impl std::fmt::Display) -> String {
+    let detail = fs::read_to_string(log_path).unwrap_or_default();
+    format!(
+        "Context7 broker startup failed: {status}; log: {}{}",
+        log_path.display(),
+        if detail.trim().is_empty() {
+            String::new()
+        } else {
+            format!("\n{}", detail.trim())
+        }
+    )
 }
 
 async fn broker_healthy(client: &Client, url: &str, token: &str) -> bool {
@@ -333,7 +335,8 @@ fn accounts_command(mut args: impl Iterator<Item = String>) -> Result<(), Box<dy
             let name = args.next().ok_or("usage: accounts add NAME")?;
             reject_extra_args(&mut args, "accounts add NAME")?;
             let key = rpassword::prompt_password("Context7 API key: ")?;
-            config::add_account(&config::accounts_path()?, &name, &key)?;
+            let key = key.trim();
+            config::add_account(&config::accounts_path()?, &name, key)?;
             println!("added {name}");
             Ok(())
         }
@@ -352,7 +355,7 @@ async fn status_command() -> Result<(), Box<dyn Error>> {
     let path = config::accounts_path()?;
     let accounts = config::load_accounts(&path)?;
     if accounts.is_empty() {
-        return Err("No accounts configured. Run accounts add or set CONTEXT7_API_KEYS".into());
+        return Err("No accounts configured. Run accounts add".into());
     }
     let context7 = Context7::new()?;
     for account in accounts {
@@ -365,14 +368,10 @@ async fn status_command() -> Result<(), Box<dyn Error>> {
 }
 
 fn config_command() -> Result<(), Box<dyn Error>> {
-    let settings = config::settings()?;
-    println!("accounts: {}", settings.accounts_path.display());
-    println!("cache: {}", settings.cache_path.display());
-    println!("token: {}", settings.token_path.display());
-    println!("listen: 127.0.0.1:{}", settings.port);
-    println!("cooldown-ms: {}", settings.cooldown.as_millis());
-    println!("cache-ttl-days: {}", settings.cache_ttl.as_secs() / 86_400);
-    println!("upstream-concurrency: 4");
+    println!("accounts: {}", config::accounts_path()?.display());
+    println!("cache: {}", config::cache_path()?.display());
+    println!("token: {}", config::token_path()?.display());
+    println!("listen: 127.0.0.1:{PORT}");
     Ok(())
 }
 
@@ -481,8 +480,6 @@ mod tests {
             }],
             context7,
             directory.path().join("cache"),
-            Duration::from_secs(60),
-            Duration::from_secs(30),
         )
         .unwrap();
         let cancellation = CancellationToken::new();

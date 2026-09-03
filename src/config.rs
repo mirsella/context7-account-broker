@@ -7,12 +7,8 @@ use std::io::{self, Read, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::time::Duration;
 
 const APP_DIR: &str = "context7-account-broker";
-const DEFAULT_PORT: u16 = 14197;
-const DEFAULT_COOLDOWN_MS: u64 = 30_000;
-const DEFAULT_CACHE_DAYS: u64 = 30;
 static TEMP_FILE_ID: AtomicU64 = AtomicU64::new(0);
 
 #[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
@@ -28,25 +24,24 @@ struct AccountsFile {
     accounts: Vec<AccountRecord>,
 }
 
-pub(crate) struct Settings {
-    pub(crate) accounts_path: PathBuf,
-    pub(crate) cache_path: PathBuf,
-    pub(crate) token_path: PathBuf,
-    pub(crate) port: u16,
-    pub(crate) cooldown: Duration,
-    pub(crate) cache_ttl: Duration,
-}
-
-pub(crate) fn settings() -> io::Result<Settings> {
-    settings_from(&|name| env::var_os(name))
-}
-
 pub(crate) fn accounts_path() -> io::Result<PathBuf> {
     accounts_path_from(&|name| env::var_os(name))
 }
 
+pub(crate) fn cache_path() -> io::Result<PathBuf> {
+    Ok(home_path(&|name| env::var_os(name), "XDG_CACHE_HOME", ".cache")?.join(APP_DIR))
+}
+
+pub(crate) fn token_path() -> io::Result<PathBuf> {
+    Ok(
+        home_path(&|name| env::var_os(name), "XDG_CONFIG_HOME", ".config")?
+            .join(APP_DIR)
+            .join("server-token"),
+    )
+}
+
 pub(crate) fn load_accounts(path: &Path) -> io::Result<Vec<AccountRecord>> {
-    load_accounts_from(path, &|name| env::var_os(name))
+    load_configured_accounts(path)
 }
 
 pub(crate) fn add_account(path: &Path, name: &str, api_key: &str) -> io::Result<()> {
@@ -72,8 +67,14 @@ pub(crate) fn read_server_token(path: &Path) -> io::Result<String> {
     ensure_parent(path)?;
     ensure_private_file(path, "server token file")?;
     let token = fs::read_to_string(path)?.trim().to_owned();
-    if token.is_empty() {
-        return Err(io::Error::other("server token file is empty"));
+    if token.len() != 64
+        || !token
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    {
+        return Err(io::Error::other(
+            "server token must contain 64 lowercase hexadecimal characters",
+        ));
     }
     Ok(token)
 }
@@ -178,97 +179,10 @@ fn private_temp(path: &Path, parent: &Path) -> io::Result<(PathBuf, fs::File)> {
     }
 }
 
-fn settings_from(get: &impl Fn(&str) -> Option<OsString>) -> io::Result<Settings> {
-    let port = parse_u64(get, "CONTEXT7_BROKER_PORT", DEFAULT_PORT as u64)?;
-    if port > u16::MAX as u64 {
-        return Err(io::Error::other("CONTEXT7_BROKER_PORT is out of range"));
-    }
-    let cache_days = parse_u64(get, "CONTEXT7_CACHE_TTL_DAYS", DEFAULT_CACHE_DAYS)?;
-    if cache_days == 0 {
-        return Err(io::Error::other("CONTEXT7_CACHE_TTL_DAYS must be positive"));
-    }
-    let cache_seconds = cache_days
-        .checked_mul(86_400)
-        .ok_or_else(|| io::Error::other("CONTEXT7_CACHE_TTL_DAYS is out of range"))?;
-    Ok(Settings {
-        accounts_path: accounts_path_from(get)?,
-        cache_path: match get("CONTEXT7_CACHE_DIR") {
-            Some(path) => path.into(),
-            None => cache_home(get)?.join(APP_DIR),
-        },
-        token_path: match get("CONTEXT7_BROKER_TOKEN_FILE") {
-            Some(path) => path.into(),
-            None => config_home(get)?.join(APP_DIR).join("server-token"),
-        },
-        port: port as u16,
-        cooldown: Duration::from_millis(parse_u64(
-            get,
-            "CONTEXT7_ACCOUNT_COOLDOWN_MS",
-            DEFAULT_COOLDOWN_MS,
-        )?),
-        cache_ttl: Duration::from_secs(cache_seconds),
-    })
-}
-
 fn accounts_path_from(get: &impl Fn(&str) -> Option<OsString>) -> io::Result<PathBuf> {
-    match get("CONTEXT7_BROKER_CONFIG") {
-        Some(path) => Ok(path.into()),
-        None => Ok(config_home(get)?.join(APP_DIR).join("accounts.json")),
-    }
-}
-
-fn load_accounts_from(
-    path: &Path,
-    get: &impl Fn(&str) -> Option<OsString>,
-) -> io::Result<Vec<AccountRecord>> {
-    let mut accounts = load_configured_accounts(path)?;
-    if accounts.is_empty() || env_text(get, "CONTEXT7_BROKER_INCLUDE_ENV")?.as_deref() == Some("1")
-    {
-        let mut keys: HashSet<_> = accounts
-            .iter()
-            .map(|account| account.api_key.clone())
-            .collect();
-        let mut names: HashSet<_> = accounts
-            .iter()
-            .map(|account| account.name.clone())
-            .collect();
-        let mut index = 1;
-        for api_key in environment_keys(get)? {
-            if keys.insert(api_key.clone()) {
-                while names.contains(&format!("env-{index}")) {
-                    index += 1;
-                }
-                let name = format!("env-{index}");
-                names.insert(name.clone());
-                accounts.push(AccountRecord { name, api_key });
-                index += 1;
-            }
-        }
-    }
-    validate_accounts(&accounts)?;
-    Ok(accounts)
-}
-
-fn environment_keys(get: &impl Fn(&str) -> Option<OsString>) -> io::Result<Vec<String>> {
-    let mut keys = Vec::new();
-    for variable in ["CONTEXT7_API_KEYS", "CONTEXT7_API_KEY"] {
-        if let Some(value) = env_text(get, variable)? {
-            for key in value
-                .split(|character: char| character.is_whitespace() || character == ',')
-                .filter(|key| !key.is_empty())
-            {
-                if !key.starts_with("ctx7sk") {
-                    return Err(io::Error::other(
-                        "environment API key must start with ctx7sk",
-                    ));
-                }
-                if !keys.iter().any(|known| known == key) {
-                    keys.push(key.to_owned());
-                }
-            }
-        }
-    }
-    Ok(keys)
+    Ok(home_path(get, "XDG_CONFIG_HOME", ".config")?
+        .join(APP_DIR)
+        .join("accounts.json"))
 }
 
 fn load_configured_accounts(path: &Path) -> io::Result<Vec<AccountRecord>> {
@@ -356,41 +270,28 @@ fn ensure_private_file(path: &Path, label: &str) -> io::Result<()> {
     Ok(())
 }
 
-fn config_home(get: &impl Fn(&str) -> Option<OsString>) -> io::Result<PathBuf> {
-    home_path(get, "XDG_CONFIG_HOME", ".config")
-}
-
-fn cache_home(get: &impl Fn(&str) -> Option<OsString>) -> io::Result<PathBuf> {
-    home_path(get, "XDG_CACHE_HOME", ".cache")
-}
-
 fn home_path(
     get: &impl Fn(&str) -> Option<OsString>,
     xdg_name: &str,
     home_suffix: &str,
 ) -> io::Result<PathBuf> {
-    get(xdg_name)
-        .map(PathBuf::from)
-        .or_else(|| get("HOME").map(|home| PathBuf::from(home).join(home_suffix)))
-        .ok_or_else(|| io::Error::other("HOME is not set"))
+    if let Some(path) = env_path(get, xdg_name)? {
+        return Ok(path);
+    }
+    Ok(env_path(get, "HOME")?
+        .ok_or_else(|| io::Error::other("HOME is not set"))?
+        .join(home_suffix))
 }
 
-fn env_text(get: &impl Fn(&str) -> Option<OsString>, name: &str) -> io::Result<Option<String>> {
-    get(name)
-        .map(|value| {
-            value
-                .into_string()
-                .map_err(|_| io::Error::other(format!("{name} must be valid Unicode")))
-        })
-        .transpose()
-}
-
-fn parse_u64(get: &impl Fn(&str) -> Option<OsString>, name: &str, default: u64) -> io::Result<u64> {
-    env_text(get, name)?.map_or(Ok(default), |value| {
-        value
-            .parse()
-            .map_err(|_| io::Error::other(format!("{name} must be an integer")))
-    })
+fn env_path(get: &impl Fn(&str) -> Option<OsString>, name: &str) -> io::Result<Option<PathBuf>> {
+    let Some(value) = get(name).filter(|value| !value.is_empty()) else {
+        return Ok(None);
+    };
+    let path = PathBuf::from(value);
+    if !path.is_absolute() {
+        return Err(io::Error::other(format!("{name} must be an absolute path")));
+    }
+    Ok(Some(path))
 }
 
 #[cfg(test)]
@@ -403,26 +304,7 @@ mod tests {
     }
 
     #[test]
-    fn configured_accounts_are_an_allowlist_unless_env_is_enabled() {
-        let directory = tempfile::tempdir().unwrap();
-        let mut environment = values(directory.path());
-        environment.insert(
-            "CONTEXT7_BROKER_CONFIG".to_owned(),
-            directory.path().join("private/accounts.json").into(),
-        );
-        environment.insert("CONTEXT7_API_KEYS".to_owned(), "ctx7sk-env".into());
-        let get = |name: &str| environment.get(name).cloned();
-        let path = accounts_path_from(&get).unwrap();
-        add_account(&path, "saved", "ctx7sk-saved").unwrap();
-        assert_eq!(load_accounts_from(&path, &get).unwrap().len(), 1);
-        environment.insert("CONTEXT7_BROKER_INCLUDE_ENV".to_owned(), "1".into());
-        let accounts = load_accounts_from(&path, &|name| environment.get(name).cloned()).unwrap();
-        assert_eq!(accounts.len(), 2);
-        assert_eq!(accounts[1].name, "env-1");
-    }
-
-    #[test]
-    fn rejects_invalid_accounts_and_ttl_overflow() {
+    fn rejects_invalid_accounts_and_relative_xdg_paths() {
         let duplicate = vec![
             AccountRecord {
                 name: "one".to_owned(),
@@ -443,11 +325,8 @@ mod tests {
         );
         let directory = tempfile::tempdir().unwrap();
         let mut environment = values(directory.path());
-        environment.insert(
-            "CONTEXT7_CACHE_TTL_DAYS".to_owned(),
-            u64::MAX.to_string().into(),
-        );
-        assert!(settings_from(&|name| environment.get(name).cloned()).is_err());
+        environment.insert("XDG_CONFIG_HOME".to_owned(), "relative".into());
+        assert!(accounts_path_from(&|name| environment.get(name).cloned()).is_err());
     }
 
     #[test]

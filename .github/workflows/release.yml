@@ -3,6 +3,10 @@ name: release
 on:
   workflow_dispatch:
 
+concurrency:
+  group: release
+  cancel-in-progress: false
+
 jobs:
   release:
     runs-on: ubuntu-latest
@@ -33,8 +37,18 @@ jobs:
       - run: pnpm install --frozen-lockfile
 
       - name: Verify package
+        env:
+          GH_TOKEN: ${{ github.token }}
         run: |
-          test "$(node -p "require('./package.json').version")" = "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          version="$(node -p "require('./package.json').version")"
+          test "$version" = "$(cargo metadata --no-deps --format-version 1 | jq -r '.packages[0].version')"
+          if npm view "@mirsella/context7-account-broker@$version" version >/dev/null 2>&1; then
+            echo "@mirsella/context7-account-broker@$version is already published" >&2
+            exit 1
+          fi
+          if target="$(gh release view "v$version" --json targetCommitish --jq .targetCommitish 2>/dev/null)"; then
+            test "$target" = "$GITHUB_SHA"
+          fi
           pnpm test
 
       - name: Build and package release
@@ -69,10 +83,4 @@ jobs:
           fi
 
       - name: Publish npm package
-        run: |
-          version="$(node -p "require('./package.json').version")"
-          if npm view "@mirsella/context7-account-broker@$version" version >/dev/null 2>&1; then
-            echo "@mirsella/context7-account-broker@$version is already published"
-          else
-            npm publish --access public --provenance --ignore-scripts
-          fi
+        run: npm publish --access public --provenance --ignore-scripts

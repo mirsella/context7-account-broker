@@ -11,16 +11,16 @@ const parsedLaunch = {
 const launch = JSON.stringify(parsedLaunch);
 
 function fakeShell(stdout = launch) {
-	let calls = 0;
-	const shell = () => {
-		calls++;
+	const calls: unknown[][] = [];
+	const shell = (...args: unknown[]) => {
+		calls.push(args);
 		const command = {
 			quiet: () => command,
 			nothrow: async () => ({ exitCode: 0, stdout, stderr: "" }),
 		};
 		return command;
 	};
-	return { shell, calls: () => calls };
+	return { shell, calls };
 }
 
 describe("OpenCode plugin", () => {
@@ -36,7 +36,7 @@ describe("OpenCode plugin", () => {
 		const hooks = await server({ $: native.shell } as never);
 		const config = { mcp: { "context7-broker": { type: "local" } } };
 		await expect(hooks.config!(config as never)).rejects.toThrow("cannot replace");
-		expect(native.calls()).toBe(0);
+		expect(native.calls).toEqual([]);
 	});
 
 	test("injects the authenticated remote MCP configuration", async () => {
@@ -48,12 +48,13 @@ describe("OpenCode plugin", () => {
 			const hooks = await server({ $: native.shell } as never);
 			const config: { mcp?: Record<string, unknown> } = {};
 			await hooks.config!(config as never);
-			expect(native.calls()).toBe(1);
+			expect(native.calls).toHaveLength(1);
+			expect(native.calls[0]?.[1]).toEqual([expect.stringContaining("vendor/context7-account-broker"), "start"]);
 			expect(config.mcp).toEqual({
 				"context7-broker": {
 					type: "remote",
 					url: "http://127.0.0.1:14197/mcp",
-					enabled: true,
+					oauth: false,
 					timeout: 30_000,
 					headers: {
 						Authorization: `Bearer ${"a".repeat(64)}`,

@@ -1,6 +1,6 @@
 #[cfg(test)]
 use reqwest::header::AUTHORIZATION;
-use reqwest::header::HeaderMap;
+use reqwest::header::{HeaderMap, RETRY_AFTER};
 use reqwest::{Client, Request as HttpRequest, StatusCode};
 use rmcp::model::{CallToolResult, ContentBlock};
 use serde::{Deserialize, Serialize};
@@ -53,19 +53,20 @@ pub(crate) struct Upstream {
     pub(crate) status: StatusCode,
     pub(crate) result: CallToolResult,
     pub(crate) quota: Option<Quota>,
+    pub(crate) retry_after: Option<Duration>,
     pub(crate) libraries: Vec<String>,
 }
 
 #[derive(Debug)]
 pub(crate) enum Error {
     Network(String),
-    Invalid(String),
+    Response(String),
 }
 
 impl Error {
     pub(crate) fn message(&self) -> &str {
         match self {
-            Self::Network(message) | Self::Invalid(message) => message,
+            Self::Network(message) | Self::Response(message) => message,
         }
     }
 }
@@ -122,14 +123,14 @@ impl Context7 {
         };
         let (status, headers, _) = self.send(api_key, &request).await?;
         if status != StatusCode::OK && status != StatusCode::TOO_MANY_REQUESTS {
-            return Err(Error::Invalid(format!(
+            return Err(Error::Response(format!(
                 "quota check returned HTTP {status} without valid quota headers"
             )));
         }
         quota_from_headers(&headers, status)
-            .map_err(Error::Invalid)?
+            .map_err(Error::Response)?
             .ok_or_else(|| {
-                Error::Invalid(format!(
+                Error::Response(format!(
                     "quota check returned HTTP {status} without valid quota headers"
                 ))
             })
@@ -142,7 +143,7 @@ impl Context7 {
             .query(&query)
             .bearer_auth(api_key)
             .build()
-            .map_err(|error| Error::Invalid(error.to_string()))
+            .map_err(|error| Error::Network(error.to_string()))
     }
 
     async fn send(
@@ -167,7 +168,7 @@ impl Context7 {
 
 pub(crate) fn quota_summary(quota: &Quota) -> String {
     let used = quota.limit - quota.remaining;
-    let percentage = (used.saturating_mul(100) + quota.limit / 2) / quota.limit;
+    let percentage = used.saturating_mul(100).saturating_add(quota.limit / 2) / quota.limit;
     let reset = quota
         .reset_at
         .duration_since(UNIX_EPOCH)
@@ -194,11 +195,13 @@ fn decode(
             None
         }
     };
-    if !status.is_success() {
+    let retry_after = retry_after(headers);
+    if status != StatusCode::OK {
         return Ok(Upstream {
             status,
             result: CallToolResult::error(vec![ContentBlock::text(error_message(body, status))]),
             quota,
+            retry_after,
             libraries: Vec::new(),
         });
     }
@@ -212,11 +215,12 @@ fn decode(
                 body
             })]),
             quota,
+            retry_after,
             libraries: Vec::new(),
         }),
         Request::Search { .. } => {
             let search: SearchResponse = serde_json::from_str(body).map_err(|_| {
-                Error::Invalid("Context7 returned an invalid library search response".to_owned())
+                Error::Response("Context7 returned an invalid library search response".to_owned())
             })?;
             let libraries = search
                 .results
@@ -234,8 +238,24 @@ fn decode(
                 status,
                 result: CallToolResult::success(vec![ContentBlock::text(text)]),
                 quota,
+                retry_after,
                 libraries,
             })
+        }
+    }
+}
+
+fn retry_after(headers: &HeaderMap) -> Option<Duration> {
+    let value = headers.get(RETRY_AFTER)?;
+    match value
+        .to_str()
+        .ok()
+        .and_then(|value| value.trim().parse().ok())
+    {
+        Some(seconds) => Some(Duration::from_secs(seconds)),
+        None => {
+            eprintln!("warning: Context7 returned an invalid Retry-After header; ignoring it");
+            None
         }
     }
 }
@@ -277,12 +297,23 @@ fn quota_from_headers(headers: &HeaderMap, status: StatusCode) -> Result<Option<
 }
 
 fn error_message(body: &str, status: StatusCode) -> String {
-    if let Ok(value) = serde_json::from_str::<ErrorResponse>(body)
-        && let Some(message) = value.message
-    {
-        return message;
+    if let Ok(value) = serde_json::from_str::<ErrorResponse>(body) {
+        if status == StatusCode::MOVED_PERMANENTLY
+            && let Some(redirect) = value.redirect_url
+        {
+            return format!(
+                "{} Use {redirect} instead.",
+                value
+                    .message
+                    .unwrap_or_else(|| "The requested library moved.".to_owned())
+            );
+        }
+        if let Some(message) = value.message {
+            return message;
+        }
     }
     match status {
+        StatusCode::ACCEPTED => "The library is not finalized yet; retry later.".to_owned(),
         StatusCode::TOO_MANY_REQUESTS => "Rate limited or quota exceeded.".to_owned(),
         StatusCode::NOT_FOUND => "The requested library does not exist.".to_owned(),
         StatusCode::UNAUTHORIZED => "Invalid Context7 API key.".to_owned(),
@@ -364,6 +395,8 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
 #[derive(Deserialize)]
 struct ErrorResponse {
     message: Option<String>,
+    #[serde(rename = "redirectUrl")]
+    redirect_url: Option<String>,
 }
 
 #[derive(Deserialize)]
@@ -473,5 +506,23 @@ mod tests {
         .unwrap();
         assert!(response.quota.is_none());
         assert_eq!(response.result.content[0].as_text().unwrap().text, "docs");
+    }
+
+    #[test]
+    fn accepted_docs_are_errors_and_preserve_retry_after() {
+        let mut headers = HeaderMap::new();
+        headers.insert(RETRY_AFTER, "15".parse().unwrap());
+        let response = decode(
+            &Request::Docs {
+                query: "hooks".to_owned(),
+                library_id: "/vercel/next.js".to_owned(),
+            },
+            StatusCode::ACCEPTED,
+            &headers,
+            "",
+        )
+        .unwrap();
+        assert_eq!(response.result.is_error, Some(true));
+        assert_eq!(response.retry_after, Some(Duration::from_secs(15)));
     }
 }

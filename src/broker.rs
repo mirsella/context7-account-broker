@@ -1,5 +1,5 @@
 use crate::config::{AccountRecord, ensure_private_directory, write_private};
-use crate::context7::{Context7, Error, Quota, Request, Upstream};
+use crate::context7::{Context7, Error, Quota, Request};
 use futures::future::{BoxFuture, FutureExt, Shared};
 use reqwest::StatusCode;
 use rmcp::model::{CallToolResult, ContentBlock};
@@ -10,9 +10,11 @@ use std::io;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
-use tokio::sync::{Mutex, Semaphore};
+use tokio::sync::Semaphore;
 
 const UPSTREAM_CONCURRENCY: usize = 4;
+const ACCOUNT_COOLDOWN: Duration = Duration::from_secs(30);
+const CACHE_TTL: Duration = Duration::from_secs(30 * 86_400);
 type SharedCall = Shared<BoxFuture<'static, CallToolResult>>;
 
 struct Account {
@@ -22,46 +24,76 @@ struct Account {
     cooldown_until: Option<SystemTime>,
 }
 
+impl Account {
+    fn available(&self, now: SystemTime) -> bool {
+        !self.cooldown_until.is_some_and(|until| until > now)
+    }
+
+    fn usage(&self, now: SystemTime) -> f64 {
+        self.quota
+            .as_ref()
+            .filter(|quota| quota.limit > 0 && quota.reset_at > now)
+            .map(|quota| (quota.limit - quota.remaining) as f64 / quota.limit as f64)
+            .unwrap_or(-1.0)
+    }
+
+    fn update_quota(&mut self, incoming: Option<Quota>) {
+        let Some(incoming) = incoming else { return };
+        match &mut self.quota {
+            Some(current) if current.reset_at > incoming.reset_at => {}
+            Some(current) if current.reset_at == incoming.reset_at => {
+                current.limit = incoming.limit;
+                current.remaining = current.remaining.min(incoming.remaining);
+                current.blocked |= incoming.blocked;
+            }
+            _ => self.quota = Some(incoming),
+        }
+    }
+
+    fn cool_until(&mut self, deadline: SystemTime) {
+        self.cooldown_until = Some(
+            self.cooldown_until
+                .map_or(deadline, |current| current.max(deadline)),
+        );
+    }
+}
+
 struct Pool {
     accounts: Vec<Account>,
     next: usize,
 }
 
 impl Pool {
-    fn order(&mut self, affinity: Option<&str>, now: SystemTime) -> Vec<usize> {
+    fn order(&self, affinity: Option<&str>, now: SystemTime) -> Vec<usize> {
         let len = self.accounts.len();
         if len == 0 {
             return Vec::new();
         }
         let start = self.next % len;
-        self.next = (self.next + 1) % len;
         let mut order: Vec<_> = (0..len).collect();
         order.sort_by(|left, right| {
             let left_account = &self.accounts[*left];
             let right_account = &self.accounts[*right];
             (affinity == Some(right_account.name.as_str()))
                 .cmp(&(affinity == Some(left_account.name.as_str())))
-                .then_with(|| {
-                    quota_usage(left_account, now).total_cmp(&quota_usage(right_account, now))
-                })
+                .then_with(|| left_account.usage(now).total_cmp(&right_account.usage(now)))
                 .then_with(|| ((*left + len - start) % len).cmp(&((*right + len - start) % len)))
         });
         order
     }
 
-    fn available(&self, index: usize, now: SystemTime) -> bool {
-        !self.accounts[index]
-            .cooldown_until
-            .is_some_and(|until| until > now)
+    fn advance(&mut self) {
+        if !self.accounts.is_empty() {
+            self.next = (self.next + 1) % self.accounts.len();
+        }
     }
 }
 
 pub(crate) struct Broker {
     context7: Context7,
     cache: Cache,
-    cooldown: Duration,
     semaphore: Semaphore,
-    pool: Mutex<Pool>,
+    pool: StdMutex<Pool>,
     inflight: StdMutex<HashMap<String, SharedCall>>,
 }
 
@@ -70,15 +102,12 @@ impl Broker {
         records: Vec<AccountRecord>,
         context7: Context7,
         cache_path: impl Into<PathBuf>,
-        cache_ttl: Duration,
-        cooldown: Duration,
     ) -> io::Result<Arc<Self>> {
         Ok(Arc::new(Self {
             context7,
-            cache: Cache::new(cache_path, cache_ttl)?,
-            cooldown,
+            cache: Cache::new(cache_path, CACHE_TTL)?,
             semaphore: Semaphore::new(UPSTREAM_CONCURRENCY),
-            pool: Mutex::new(Pool {
+            pool: StdMutex::new(Pool {
                 accounts: records
                     .into_iter()
                     .map(|record| Account {
@@ -139,32 +168,28 @@ impl Broker {
         let affinity = tokio::task::spawn_blocking(move || cache.affinity(&subject))
             .await
             .expect("cache read task panicked");
-        let candidates = {
-            let mut pool = self.pool.lock().await;
+        let lookup = {
+            let pool = self.pool.lock().expect("account pool mutex poisoned");
             let order = pool.order(affinity.as_deref(), SystemTime::now());
             order
                 .into_iter()
                 .map(|index| {
                     let account = &pool.accounts[index];
-                    (index, account.name.clone(), account.api_key.clone())
+                    (account.name.clone(), account.api_key.clone())
                 })
                 .collect::<Vec<_>>()
         };
 
-        let affinity_valid = affinity
-            .as_deref()
-            .is_some_and(|name| candidates.iter().any(|(_, candidate, _)| candidate == name));
-        let lookup: Vec<_> = candidates
-            .iter()
-            .map(|(_, name, key)| (name.clone(), key.clone()))
-            .collect();
         let cache = self.cache.clone();
         let cache_key = request_key.to_owned();
         let subject = request.subject().to_owned();
+        let cached_affinity = affinity.clone();
         if let Some(result) = tokio::task::spawn_blocking(move || {
             for (account, api_key) in lookup {
                 if let Some(result) = cache.result(&cache_key, &api_key) {
-                    if !affinity_valid && let Err(error) = cache.set_affinity(&subject, &account) {
+                    if cached_affinity.as_deref() != Some(&account)
+                        && let Err(error) = cache.set_affinity(&subject, &account)
+                    {
                         eprintln!("warning: failed to restore affinity cache: {error}");
                     }
                     return Some(result);
@@ -178,10 +203,29 @@ impl Broker {
             return result;
         }
 
+        let candidates = {
+            let mut pool = self.pool.lock().expect("account pool mutex poisoned");
+            let order = pool.order(affinity.as_deref(), SystemTime::now());
+            pool.advance();
+            order
+                .into_iter()
+                .map(|index| {
+                    let account = &pool.accounts[index];
+                    (index, account.name.clone(), account.api_key.clone())
+                })
+                .collect::<Vec<_>>()
+        };
+
         let mut shared_failures = 0;
         let mut last_error = None;
         for (index, account_name, api_key) in candidates {
-            if !self.pool.lock().await.available(index, SystemTime::now()) {
+            if !self
+                .pool
+                .lock()
+                .expect("account pool mutex poisoned")
+                .accounts[index]
+                .available(SystemTime::now())
+            {
                 continue;
             }
             let permit = self
@@ -189,72 +233,80 @@ impl Broker {
                 .acquire()
                 .await
                 .expect("broker never closes its semaphore");
-            if !self.pool.lock().await.available(index, SystemTime::now()) {
+            if !self
+                .pool
+                .lock()
+                .expect("account pool mutex poisoned")
+                .accounts[index]
+                .available(SystemTime::now())
+            {
                 continue;
             }
             let response = self.context7.call(&api_key, &request).await;
             drop(permit);
             match response {
-                Ok(Upstream {
-                    status,
-                    result,
-                    quota,
-                    libraries,
-                }) if status.is_success() => {
-                    {
-                        let mut pool = self.pool.lock().await;
-                        pool.accounts[index].quota = quota;
-                        pool.accounts[index].cooldown_until = None;
-                    }
-                    if result.is_error != Some(true) {
-                        let cache = self.cache.clone();
-                        let cache_key = request_key.to_owned();
-                        let api_key = api_key.clone();
-                        let cached_result = result.clone();
-                        let libraries: Vec<_> = std::iter::once(request.subject().to_owned())
-                            .chain(libraries)
-                            .collect();
-                        tokio::task::spawn_blocking(move || {
-                            if let Err(error) =
-                                cache.set_result(&cache_key, &api_key, &cached_result)
-                            {
-                                eprintln!("warning: failed to write result cache: {error}");
-                            }
-                            for library in libraries {
-                                if let Err(error) = cache.set_affinity(&library, &account_name) {
-                                    eprintln!("warning: failed to write affinity cache: {error}");
-                                }
-                            }
-                        })
-                        .await
-                        .expect("cache write task panicked");
-                    }
-                    return result;
-                }
-                Ok(response)
-                    if matches!(
+                Ok(response) => {
+                    let account_failure = matches!(
                         response.status,
                         StatusCode::UNAUTHORIZED
+                            | StatusCode::PAYMENT_REQUIRED
                             | StatusCode::FORBIDDEN
                             | StatusCode::TOO_MANY_REQUESTS
-                    ) =>
-                {
-                    last_error = Some(result_text(&response.result));
-                    let mut pool = self.pool.lock().await;
-                    let account = &mut pool.accounts[index];
-                    account.quota = response.quota;
-                    account.cooldown_until =
-                        Some(if response.status == StatusCode::TOO_MANY_REQUESTS {
-                            retry_deadline(account.quota.as_ref())
-                        } else {
-                            SystemTime::now() + self.cooldown
-                        });
-                }
-                Ok(response)
-                    if response.status == StatusCode::REQUEST_TIMEOUT
-                        || response.status.as_u16() == 425
-                        || response.status.is_server_error() =>
-                {
+                    );
+                    {
+                        let mut pool = self.pool.lock().expect("account pool mutex poisoned");
+                        let account = &mut pool.accounts[index];
+                        account.update_quota(response.quota.clone());
+                        if account_failure {
+                            account.cool_until(
+                                if response.status == StatusCode::TOO_MANY_REQUESTS {
+                                    retry_deadline(account.quota.as_ref(), response.retry_after)
+                                } else {
+                                    SystemTime::now() + ACCOUNT_COOLDOWN
+                                },
+                            );
+                        }
+                    }
+
+                    if response.status == StatusCode::OK {
+                        if response.result.is_error != Some(true) {
+                            let cache = self.cache.clone();
+                            let cache_key = request_key.to_owned();
+                            let api_key = api_key.clone();
+                            let cached_result = response.result.clone();
+                            let libraries: Vec<_> = std::iter::once(request.subject().to_owned())
+                                .chain(response.libraries)
+                                .collect();
+                            tokio::task::spawn_blocking(move || {
+                                if let Err(error) =
+                                    cache.set_result(&cache_key, &api_key, &cached_result)
+                                {
+                                    eprintln!("warning: failed to write result cache: {error}");
+                                }
+                                for library in libraries {
+                                    if let Err(error) = cache.set_affinity(&library, &account_name)
+                                    {
+                                        eprintln!(
+                                            "warning: failed to write affinity cache: {error}"
+                                        );
+                                    }
+                                }
+                            })
+                            .await
+                            .expect("cache write task panicked");
+                        }
+                        return response.result;
+                    }
+                    if account_failure {
+                        last_error = Some(result_text(&response.result));
+                        continue;
+                    }
+                    if response.status != StatusCode::REQUEST_TIMEOUT
+                        && response.status.as_u16() != 425
+                        && !response.status.is_server_error()
+                    {
+                        return response.result;
+                    }
                     last_error = Some(result_text(&response.result));
                     shared_failures += 1;
                     if shared_failures == 2 {
@@ -264,8 +316,7 @@ impl Broker {
                         ));
                     }
                 }
-                Ok(response) => return response.result,
-                Err(Error::Network(message)) => {
+                Err(Error::Network(message) | Error::Response(message)) => {
                     last_error = Some(message);
                     shared_failures += 1;
                     if shared_failures == 2 {
@@ -275,7 +326,6 @@ impl Broker {
                         ));
                     }
                 }
-                Err(Error::Invalid(message)) => return broker_error(message),
             }
         }
         broker_error(
@@ -287,15 +337,6 @@ impl Broker {
 
 pub(crate) fn fingerprint(api_key: &str) -> String {
     sha256_hex(api_key.as_bytes())[..12].to_owned()
-}
-
-fn quota_usage(account: &Account, now: SystemTime) -> f64 {
-    account
-        .quota
-        .as_ref()
-        .filter(|quota| quota.limit > 0 && quota.reset_at > now)
-        .map(|quota| (quota.limit - quota.remaining) as f64 / quota.limit as f64)
-        .unwrap_or(-1.0)
 }
 
 fn result_text(result: &CallToolResult) -> String {
@@ -314,12 +355,13 @@ fn broker_error(message: impl Into<String>) -> CallToolResult {
     ))])
 }
 
-fn retry_deadline(quota: Option<&Quota>) -> SystemTime {
-    let now = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .unwrap_or_default()
-        .as_secs();
-    let next_day = UNIX_EPOCH + Duration::from_secs((now / 86_400 + 1) * 86_400);
+fn retry_deadline(quota: Option<&Quota>, retry_after: Option<Duration>) -> SystemTime {
+    let now = SystemTime::now();
+    if let Some(deadline) = retry_after.and_then(|duration| now.checked_add(duration)) {
+        return deadline;
+    }
+    let seconds = now.duration_since(UNIX_EPOCH).unwrap_or_default().as_secs();
+    let next_day = UNIX_EPOCH + Duration::from_secs((seconds / 86_400 + 1) * 86_400);
     quota
         .map(|quota| std::cmp::min(quota.reset_at, next_day))
         .unwrap_or(next_day)
@@ -354,10 +396,9 @@ impl Cache {
             Ok(result) => Some(result),
             Err(error) => {
                 eprintln!(
-                    "warning: removing corrupt cache file {}: {error}",
+                    "warning: ignoring corrupt cache file {}: {error}",
                     path.display()
                 );
-                remove_cache_file(&path);
                 None
             }
         }
@@ -380,10 +421,9 @@ impl Cache {
             Ok(account) => Some(account),
             Err(error) => {
                 eprintln!(
-                    "warning: removing corrupt cache file {}: {error}",
+                    "warning: ignoring corrupt cache file {}: {error}",
                     path.display()
                 );
-                remove_cache_file(&path);
                 None
             }
         }
@@ -422,7 +462,6 @@ impl Cache {
         }) {
             Ok(age) if age < self.ttl => {}
             Ok(_) => {
-                remove_cache_file(path);
                 return None;
             }
             Err(error) => {
@@ -430,7 +469,6 @@ impl Cache {
                     "warning: invalid cache timestamp {}: {error}",
                     path.display()
                 );
-                remove_cache_file(path);
                 return None;
             }
         }
@@ -449,8 +487,8 @@ impl Cache {
     fn cleanup(&self) -> io::Result<()> {
         for entry in fs::read_dir(&self.root)? {
             let path = entry?.path();
-            if path.is_file() && broker_cache_name(&path) {
-                let _ = self.read(&path);
+            if path.is_file() && broker_cache_name(&path) && self.read(&path).is_none() {
+                remove_cache_file(&path);
             }
         }
         Ok(())
@@ -461,8 +499,12 @@ fn broker_cache_name(path: &Path) -> bool {
     let Some(name) = path.file_stem().and_then(|name| name.to_str()) else {
         return false;
     };
-    let hash =
-        |value: &str| value.len() == 64 && value.bytes().all(|byte| byte.is_ascii_hexdigit());
+    let hash = |value: &str| {
+        value.len() == 64
+            && value
+                .bytes()
+                .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
+    };
     name.strip_prefix("affinity-").is_some_and(hash)
         || name
             .strip_prefix("result-")
@@ -519,19 +561,13 @@ mod tests {
             status: StatusCode::OK,
             result: CallToolResult::success(vec![ContentBlock::text(text)]),
             quota: None,
+            retry_after: None,
             libraries: Vec::new(),
         }
     }
 
     fn broker(context7: Context7, count: usize, path: &Path) -> Arc<Broker> {
-        Broker::new(
-            records(count),
-            context7,
-            path.join("cache"),
-            Duration::from_secs(3600),
-            Duration::from_secs(30),
-        )
-        .unwrap()
+        Broker::new(records(count), context7, path.join("cache")).unwrap()
     }
 
     #[tokio::test]
@@ -566,7 +602,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn auth_fails_over_but_shared_failures_do_not_poison_accounts() {
+    async fn account_failures_fail_over_but_shared_failures_do_not_poison_accounts() {
         let directory = tempfile::tempdir().unwrap();
         let calls = Arc::new(StdMutex::new(Vec::new()));
         let sender_calls = Arc::clone(&calls);
@@ -575,12 +611,13 @@ mod tests {
             async move {
                 calls.lock().unwrap().push(key.clone());
                 if key == "ctx7sk-0"
-                    && matches!(request, Request::Docs { ref query, .. } if query == "auth")
+                    && matches!(request, Request::Docs { ref query, .. } if query == "account")
                 {
                     return Ok(Upstream {
-                        status: StatusCode::UNAUTHORIZED,
-                        result: CallToolResult::error(vec![ContentBlock::text("bad key")]),
+                        status: StatusCode::PAYMENT_REQUIRED,
+                        result: CallToolResult::error(vec![ContentBlock::text("spending limit")]),
                         quota: None,
+                        retry_after: None,
                         libraries: Vec::new(),
                     });
                 }
@@ -593,7 +630,7 @@ mod tests {
         });
         let broker = broker(context7, 3, directory.path());
         assert_eq!(
-            broker.call(request("auth")).await.content[0]
+            broker.call(request("account")).await.content[0]
                 .as_text()
                 .unwrap()
                 .text,
@@ -646,6 +683,7 @@ mod tests {
         };
         let now = SystemTime::now();
         assert_eq!(pool.order(None, now), [0, 1, 2]);
+        pool.advance();
         assert_eq!(pool.order(None, now), [1, 2, 0]);
         pool.accounts[0].quota = Some(Quota {
             limit: 100,
@@ -667,7 +705,7 @@ mod tests {
         });
         assert_eq!(pool.order(None, now), [1, 2, 0]);
         pool.accounts[0].quota.as_mut().unwrap().reset_at = now - Duration::from_secs(1);
-        assert_eq!(quota_usage(&pool.accounts[0], now), -1.0);
+        assert_eq!(pool.accounts[0].usage(now), -1.0);
     }
 
     #[tokio::test]
@@ -687,16 +725,17 @@ mod tests {
         let task_broker = Arc::clone(&broker);
         let task = tokio::spawn(async move { task_broker.call(request("queued")).await });
         loop {
-            if broker.pool.lock().await.next == 1 {
+            if broker.pool.lock().unwrap().next == 1 {
                 break;
             }
             tokio::task::yield_now().await;
         }
-        let mut pool = broker.pool.lock().await;
-        for account in &mut pool.accounts {
-            account.cooldown_until = Some(SystemTime::now() + Duration::from_secs(60));
+        {
+            let mut pool = broker.pool.lock().unwrap();
+            for account in &mut pool.accounts {
+                account.cooldown_until = Some(SystemTime::now() + Duration::from_secs(60));
+            }
         }
-        drop(pool);
         drop(permits);
         assert_eq!(task.await.unwrap().is_error, Some(true));
         assert_eq!(calls.load(AtomicOrdering::SeqCst), 0);
@@ -747,18 +786,50 @@ mod tests {
 
     #[test]
     fn quota_retry_uses_the_earlier_deadline() {
-        let next_day = retry_deadline(None);
+        let next_day = retry_deadline(None, None);
         let quota = Quota {
             limit: 1,
             remaining: 0,
             reset_at: next_day + Duration::from_secs(1),
             blocked: true,
         };
-        assert_eq!(retry_deadline(Some(&quota)), next_day);
+        assert_eq!(retry_deadline(Some(&quota), None), next_day);
         let earlier = Quota {
             reset_at: next_day - Duration::from_secs(1),
             ..quota
         };
-        assert_eq!(retry_deadline(Some(&earlier)), earlier.reset_at);
+        assert_eq!(retry_deadline(Some(&earlier), None), earlier.reset_at);
+        let retry_after = Duration::from_secs(5);
+        let deadline = retry_deadline(Some(&quota), Some(retry_after));
+        assert!(deadline <= SystemTime::now() + retry_after);
+    }
+
+    #[test]
+    fn account_updates_do_not_restore_stale_quota_or_shorten_cooldowns() {
+        let now = SystemTime::now();
+        let mut account = Account {
+            name: "account".to_owned(),
+            api_key: "ctx7sk-key".to_owned(),
+            quota: None,
+            cooldown_until: None,
+        };
+        account.update_quota(Some(Quota {
+            limit: 100,
+            remaining: 50,
+            reset_at: now + Duration::from_secs(60),
+            blocked: false,
+        }));
+        account.update_quota(Some(Quota {
+            limit: 100,
+            remaining: 60,
+            reset_at: now + Duration::from_secs(60),
+            blocked: false,
+        }));
+        assert_eq!(account.quota.as_ref().unwrap().remaining, 50);
+
+        let later = now + Duration::from_secs(120);
+        account.cool_until(later);
+        account.cool_until(now + Duration::from_secs(30));
+        assert_eq!(account.cooldown_until, Some(later));
     }
 }

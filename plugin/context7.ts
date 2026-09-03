@@ -11,52 +11,31 @@ type NativeLaunch = {
 };
 
 export function parseNativeLaunch(stdout: string): NativeLaunch {
-	let value: unknown;
-	try {
-		value = JSON.parse(stdout);
-	} catch {
-		throw new Error("context7-account-broker start returned invalid JSON");
-	}
+	const value: unknown = JSON.parse(stdout);
 	if (!value || typeof value !== "object" || Array.isArray(value)) {
-		throw new Error("context7-account-broker start returned an invalid launch object");
+		throw new Error("context7-account-broker start returned invalid output");
 	}
 	const launch = value as Record<string, unknown>;
-	if (Object.keys(launch).sort().join(",") !== "tokenFile,url") {
-		throw new Error("context7-account-broker start returned unexpected fields");
-	}
-	if (typeof launch.url !== "string" || typeof launch.tokenFile !== "string") {
-		throw new Error("context7-account-broker start returned invalid launch fields");
-	}
-	const url = new URL(launch.url);
 	if (
-		url.protocol !== "http:" ||
-		url.hostname !== "127.0.0.1" ||
-		!url.port ||
-		url.pathname !== "/mcp" ||
-		url.username ||
-		url.password ||
-		url.search ||
-		url.hash ||
+		Object.keys(launch).sort().join(",") !== "tokenFile,url" ||
+		launch.url !== "http://127.0.0.1:14197/mcp" ||
+		typeof launch.tokenFile !== "string" ||
 		!launch.tokenFile.startsWith("/")
 	) {
-		throw new Error("context7-account-broker start returned an unsafe launch target");
+		throw new Error("context7-account-broker start returned invalid output");
 	}
-	return { url: launch.url, tokenFile: launch.tokenFile };
+	return launch as NativeLaunch;
 }
 
 export const server: Plugin = async ({ $ }) => ({
 	config: async (config) => {
 		if (config.mcp?.[MCP_NAME] !== undefined) {
-			throw new Error(
-				`@mirsella/context7-account-broker cannot replace the existing mcp.${MCP_NAME} configuration`,
-			);
+			throw new Error(`@mirsella/context7-account-broker cannot replace the existing mcp.${MCP_NAME} configuration`);
 		}
 		const result = await $`${[BINARY, "start"]}`.quiet().nothrow();
 		if (result.exitCode !== 0) {
 			const stderr = String(result.stderr).trim();
-			throw new Error(
-				`context7-account-broker start failed with exit code ${result.exitCode}${stderr ? `: ${stderr}` : ""}`,
-			);
+			throw new Error(`context7-account-broker start failed with exit code ${result.exitCode}${stderr ? `: ${stderr}` : ""}`);
 		}
 		const launch = parseNativeLaunch(String(result.stdout));
 		const token = (await readFile(launch.tokenFile, "utf8")).trim();
@@ -67,7 +46,7 @@ export const server: Plugin = async ({ $ }) => ({
 		config.mcp[MCP_NAME] = {
 			type: "remote",
 			url: launch.url,
-			enabled: true,
+			oauth: false,
 			timeout: 30_000,
 			headers: {
 				Authorization: `Bearer ${token}`,
