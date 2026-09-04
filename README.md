@@ -27,9 +27,9 @@ That is the complete OpenCode configuration. Do not add an `mcp.context7-broker`
 
 ## Lifecycle
 
-When OpenCode loads the plugin, the packaged Linux x64 binary runs `start`. It creates a private server token if needed, reuses an authenticated healthy broker on `127.0.0.1:14197`, or launches one when absent. The plugin reads the token into OpenCode's in-memory MCP configuration; it never writes the token to `opencode.json` or passes it in process arguments.
+When OpenCode loads the plugin, the packaged Linux x64 binary runs `start`. It creates private runtime state for that package version, reuses its matching healthy broker, or launches one on an available loopback port. Each broker process gets a fresh token, which `start` returns directly to the plugin for OpenCode's in-memory MCP configuration. The token is never written to `opencode.json` or passed in process arguments.
 
-The broker stays available across project and session lifetimes. Its containing process manager may stop it with OpenCode; a later plugin launch reuses it when healthy or starts a replacement when it is absent. There is no supervisor, heartbeat, separate systemd unit, PATH installation, manual token, or last-client shutdown.
+OpenCode processes using the same plugin version share one broker. Separate OpenCode processes can use different plugin versions at the same time because each version has its own port, token, cache, and broker process. A broker stays available across project and session lifetimes; its containing process manager may stop it with OpenCode. There is no supervisor, heartbeat, separate systemd unit, PATH installation, manual token, or last-client shutdown.
 
 Startup makes no Context7 requests. Context7 is contacted only for tool calls and the explicit `status` command.
 
@@ -37,7 +37,6 @@ Startup makes no Context7 requests. Context7 is contacted only for tool calls an
 
 ```text
 context7-account-broker start
-context7-account-broker serve
 context7-account-broker accounts list
 context7-account-broker accounts add NAME
 context7-account-broker accounts remove NAME
@@ -57,15 +56,15 @@ The command prints each account's used and total requests, percentage used, bloc
 
 ## Architecture
 
-The plugin contains a static `x86_64-unknown-linux-musl` binary. One current-thread Tokio process exposes authenticated Streamable HTTP MCP on loopback. It forwards requests directly to the official Context7 REST API with bounded concurrency four.
+The plugin contains a static `x86_64-unknown-linux-musl` binary. Each active package version runs one current-thread Tokio process exposing authenticated Streamable HTTP MCP on an OS-assigned loopback port. It forwards requests directly to the official Context7 REST API with bounded concurrency four.
 
-The broker provides the canonical `resolve-library-id` and `query-docs` tools. It routes toward account affinity and lower quota use, rotates unknown quota fairly, fails over account-specific `401`, `403`, and `429` responses, and caps shared endpoint failures at two attempts. Successful results use an account-partitioned disk cache. Identical typed requests share one cancellation-safe in-flight producer.
+The broker provides the canonical `resolve-library-id` and `query-docs` tools. It routes toward account affinity and lower quota use, rotates unknown quota fairly, fails over account-specific `401`, `402`, `403`, and `429` responses, and caps shared endpoint failures at two attempts. Successful results use an account-partitioned disk cache. Identical typed requests share one cancellation-safe in-flight producer.
 
 Default private state:
 
 - Accounts: `${XDG_CONFIG_HOME:-$HOME/.config}/context7-account-broker/accounts.json`
-- Server token: `${XDG_CONFIG_HOME:-$HOME/.config}/context7-account-broker/server-token`
-- Cache and launch log: `${XDG_CACHE_HOME:-$HOME/.cache}/context7-account-broker/`
+- Broker state: `${XDG_CONFIG_HOME:-$HOME/.config}/context7-account-broker/<version>/broker.json`
+- Cache and log: `${XDG_CACHE_HOME:-$HOME/.cache}/context7-account-broker/<version>/`
 
 ## License
 

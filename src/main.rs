@@ -4,7 +4,7 @@ mod context7;
 
 use axum::Router;
 use axum::body::Body;
-use axum::extract::State;
+use axum::extract::{Query, State};
 use axum::http::{HeaderValue, Request as HttpRequest, StatusCode, header};
 use axum::middleware::{self, Next};
 use axum::response::{IntoResponse, Response};
@@ -12,6 +12,8 @@ use axum::routing::get;
 use broker::Broker;
 use context7::{Context7, Request, quota_summary};
 use reqwest::Client;
+use ring::hmac;
+use ring::rand::{SecureRandom, SystemRandom};
 use rmcp::handler::server::wrapper::Parameters;
 use rmcp::model::CallToolResult;
 use rmcp::schemars;
@@ -21,10 +23,11 @@ use rmcp::transport::streamable_http_server::tower::{
 };
 use rmcp::{ServerHandler, tool, tool_handler, tool_router};
 use serde::{Deserialize, Serialize};
-use serde_json::json;
 use std::error::Error;
 use std::fs;
+use std::io::Read;
 use std::net::SocketAddr;
+use std::os::unix::fs::{OpenOptionsExt, PermissionsExt};
 use std::os::unix::process::CommandExt;
 use std::process::{Command, Stdio};
 use std::sync::Arc;
@@ -33,13 +36,22 @@ use tokio_util::sync::CancellationToken;
 
 const STARTUP_DEADLINE: Duration = Duration::from_secs(5);
 const HEALTH_TIMEOUT: Duration = Duration::from_millis(250);
-const PORT: u16 = 14197;
-
 #[derive(Serialize)]
 struct StartOutput {
     url: String,
-    #[serde(rename = "tokenFile")]
-    token_file: String,
+    token: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Serialize, PartialEq, Eq)]
+#[serde(deny_unknown_fields)]
+struct ServerState {
+    port: u16,
+    token: String,
+}
+
+#[derive(Deserialize)]
+struct HealthQuery {
+    challenge: String,
 }
 
 #[derive(Deserialize, schemars::JsonSchema)]
@@ -139,22 +151,33 @@ async fn authenticate(
     next.run(request).await
 }
 
-async fn health() -> impl IntoResponse {
-    axum::Json(json!({ "status": "ok" }))
+async fn health(
+    State(key): State<Arc<hmac::Key>>,
+    Query(query): Query<HealthQuery>,
+) -> Result<(StatusCode, [(&'static str, String); 1]), StatusCode> {
+    if !is_token(&query.challenge) {
+        return Err(StatusCode::BAD_REQUEST);
+    }
+    Ok((
+        StatusCode::NO_CONTENT,
+        [(
+            "x-context7-broker-proof",
+            encode_hex(hmac::sign(&key, query.challenge.as_bytes()).as_ref()),
+        )],
+    ))
 }
 
 #[tokio::main(flavor = "current_thread")]
 async fn main() -> Result<(), Box<dyn Error>> {
     let mut args = std::env::args().skip(1);
     match args.next().as_deref() {
-        None => serve().await,
-        Some("serve") => {
-            reject_extra_args(&mut args, "serve")?;
-            serve().await
-        }
-        Some("start") => {
+        None | Some("start") => {
             reject_extra_args(&mut args, "start")?;
             start().await
+        }
+        Some("__serve") => {
+            reject_extra_args(&mut args, "__serve")?;
+            serve().await
         }
         Some("accounts") => accounts_command(args),
         Some("status") => {
@@ -175,18 +198,37 @@ async fn main() -> Result<(), Box<dyn Error>> {
 }
 
 async fn serve() -> Result<(), Box<dyn Error>> {
-    let token_path = config::token_path()?;
-    let token = config::read_server_token(&token_path)?;
-    let authorization = HeaderValue::from_str(&format!("Bearer {token}"))?;
-    let address = SocketAddr::from(([127, 0, 0, 1], PORT));
+    let runtime_path = config::runtime_path()?;
+    config::ensure_private_directory(&runtime_path)?;
+    let startup_lock = open_directory_lock(&runtime_path)?;
+    startup_lock.lock()?;
+    let lock_path = runtime_path.join("broker.lock");
+    let broker_lock = open_lock(&lock_path)?;
+    broker_lock
+        .try_lock()
+        .map_err(|_| "broker already running for this package version")?;
+    let cache_path = config::cache_path()?;
+    let address = SocketAddr::from(([127, 0, 0, 1], 0));
     let listener = tokio::net::TcpListener::bind(address).await?;
+    let address = listener.local_addr()?;
     let accounts = config::load_accounts(&config::accounts_path()?)?;
     if accounts.is_empty() {
         return Err("No accounts configured. Run accounts add".into());
     }
-    let broker = Broker::new(accounts, Context7::new()?, config::cache_path()?)?;
+    let broker = Broker::new(accounts, Context7::new()?, cache_path)?;
+    let state_path = runtime_path.join("broker.json");
+    let _ = fs::remove_file(&state_path);
+    let token = random_token().map_err(|_| "failed to generate broker token")?;
     let cancellation = CancellationToken::new();
-    let app = application(broker, authorization, cancellation.clone());
+    let app = application(broker, &token, cancellation.clone());
+    config::write_private(
+        &state_path,
+        &serde_json::to_vec(&ServerState {
+            port: address.port(),
+            token,
+        })?,
+    )?;
+    startup_lock.unlock()?;
     eprintln!("context7-account-broker listening on http://{address}");
     let mut terminate = tokio::signal::unix::signal(tokio::signal::unix::SignalKind::terminate())?;
     let shutdown = cancellation.clone();
@@ -204,14 +246,14 @@ async fn serve() -> Result<(), Box<dyn Error>> {
     axum::serve(listener, app)
         .with_graceful_shutdown(async move { cancellation.cancelled().await })
         .await?;
+    drop(broker_lock);
     Ok(())
 }
 
-fn application(
-    broker: Arc<Broker>,
-    authorization: HeaderValue,
-    cancellation: CancellationToken,
-) -> Router {
+fn application(broker: Arc<Broker>, token: &str, cancellation: CancellationToken) -> Router {
+    let authorization = HeaderValue::from_str(&format!("Bearer {token}"))
+        .expect("validated token is a valid header value");
+    let health_key = Arc::new(hmac::Key::new(hmac::HMAC_SHA256, token.as_bytes()));
     let handler_broker = Arc::clone(&broker);
     let service = StreamableHttpService::new(
         move || {
@@ -225,30 +267,61 @@ fn application(
             .with_json_response(true)
             .with_cancellation_token(cancellation.clone()),
     );
+    let mcp = Router::new()
+        .fallback_service(service)
+        .layer(middleware::from_fn_with_state(authorization, authenticate));
     Router::new()
-        .nest("/mcp", Router::new().fallback_service(service))
         .route("/health", get(health))
-        .layer(middleware::from_fn_with_state(authorization, authenticate))
+        .nest("/mcp", mcp)
+        .with_state(health_key)
 }
 
 async fn start() -> Result<(), Box<dyn Error>> {
-    let token_path = config::token_path()?;
-    let token = config::ensure_server_token(&token_path)?;
-    let token_path = fs::canonicalize(token_path)?;
-    let token_file = token_path
-        .to_str()
-        .ok_or("server token path must be valid Unicode")?
-        .to_owned();
-    let url = format!("http://127.0.0.1:{PORT}/mcp");
-    let health_url = format!("http://127.0.0.1:{PORT}/health");
-    let client = Client::builder().timeout(HEALTH_TIMEOUT).build()?;
-    if broker_healthy(&client, &health_url, &token).await {
+    let runtime_path = config::runtime_path()?;
+    config::ensure_private_directory(&runtime_path)?;
+    let runtime_path = fs::canonicalize(runtime_path)?;
+    let client = Client::builder()
+        .timeout(HEALTH_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()?;
+    let state_path = runtime_path.join("broker.json");
+    let broker_lock_path = runtime_path.join("broker.lock");
+    let deadline = tokio::time::Instant::now() + STARTUP_DEADLINE;
+    let lock = open_directory_lock(&runtime_path)?;
+    loop {
+        match lock.try_lock() {
+            Ok(()) => break,
+            Err(fs::TryLockError::WouldBlock) if tokio::time::Instant::now() < deadline => {
+                tokio::time::sleep(Duration::from_millis(50)).await;
+            }
+            Err(fs::TryLockError::WouldBlock) => return Err("broker startup lock timed out".into()),
+            Err(fs::TryLockError::Error(error)) => return Err(error.into()),
+        }
+    }
+    let print_launch = |state: ServerState| -> Result<(), Box<dyn Error>> {
         println!(
             "{}",
-            serde_json::to_string(&StartOutput { url, token_file })?
+            serde_json::to_string(&StartOutput {
+                url: format!("http://127.0.0.1:{}/mcp", state.port),
+                token: state.token,
+            })?
         );
-        return Ok(());
+        Ok(())
+    };
+    loop {
+        if !broker_running(&broker_lock_path)? {
+            break;
+        }
+        if let Some(state) = active_launch(&client, &state_path).await {
+            print_launch(state)?;
+            return Ok(());
+        }
+        if tokio::time::Instant::now() >= deadline {
+            return Err("broker startup timed out".into());
+        }
+        tokio::time::sleep(Duration::from_millis(50)).await;
     }
+    let _ = fs::remove_file(&state_path);
 
     let cache_path = config::cache_path()?;
     config::ensure_private_directory(&cache_path)?;
@@ -257,28 +330,23 @@ async fn start() -> Result<(), Box<dyn Error>> {
     let log = fs::OpenOptions::new().append(true).open(&log_path)?;
     let mut command = Command::new(std::env::current_exe()?);
     command
-        .arg("serve")
+        .arg("__serve")
         .stdin(Stdio::null())
         .stdout(Stdio::null())
         .stderr(Stdio::from(log))
         .process_group(0);
     let mut child = command.spawn()?;
-    let deadline = tokio::time::Instant::now() + STARTUP_DEADLINE;
+    lock.unlock()?;
     loop {
         let child_status = child.try_wait()?;
-        if broker_healthy(&client, &health_url, &token).await {
-            println!(
-                "{}",
-                serde_json::to_string(&StartOutput { url, token_file })?
-            );
-            return Ok(());
-        }
         if let Some(status) = child_status
-            && tokio::net::TcpStream::connect(SocketAddr::from(([127, 0, 0, 1], PORT)))
-                .await
-                .is_err()
+            && !broker_running(&broker_lock_path)?
         {
             return Err(startup_error(&log_path, format!("child exited with {status}")).into());
+        }
+        if let Some(state) = active_launch(&client, &state_path).await {
+            print_launch(state)?;
+            return Ok(());
         }
         if tokio::time::Instant::now() >= deadline {
             let _ = child.kill();
@@ -306,19 +374,103 @@ fn startup_error(log_path: &std::path::Path, status: impl std::fmt::Display) -> 
     )
 }
 
-async fn broker_healthy(client: &Client, url: &str, token: &str) -> bool {
-    let Ok(response) = client.get(url).bearer_auth(token).send().await else {
+async fn broker_healthy(client: &Client, port: u16, token: &str) -> bool {
+    let Ok(challenge) = random_token() else {
         return false;
     };
-    if response.status() != StatusCode::OK {
-        return false;
-    }
-    response
-        .text()
+    let expected = encode_hex(
+        hmac::sign(
+            &hmac::Key::new(hmac::HMAC_SHA256, token.as_bytes()),
+            challenge.as_bytes(),
+        )
+        .as_ref(),
+    );
+    client
+        .get(format!("http://127.0.0.1:{port}/health"))
+        .query(&[("challenge", challenge)])
+        .send()
         .await
-        .ok()
-        .and_then(|body| serde_json::from_str::<serde_json::Value>(&body).ok())
-        == Some(json!({ "status": "ok" }))
+        .is_ok_and(|response| {
+            response.status() == StatusCode::NO_CONTENT
+                && response
+                    .headers()
+                    .get("x-context7-broker-proof")
+                    .is_some_and(|proof| proof.as_bytes() == expected.as_bytes())
+        })
+}
+
+async fn active_launch(client: &Client, state_path: &std::path::Path) -> Option<ServerState> {
+    let state = read_state(state_path)?;
+    broker_healthy(client, state.port, &state.token)
+        .await
+        .then_some(state)
+}
+
+fn read_state(path: &std::path::Path) -> Option<ServerState> {
+    let mut file = fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+        .ok()?;
+    let metadata = file.metadata().ok()?;
+    if !metadata.is_file() || metadata.len() > 256 || metadata.permissions().mode() & 0o077 != 0 {
+        return None;
+    }
+    let mut bytes = Vec::with_capacity(metadata.len() as usize);
+    file.by_ref().take(257).read_to_end(&mut bytes).ok()?;
+    let state: ServerState = serde_json::from_slice(&bytes).ok()?;
+    (state.port != 0 && is_token(&state.token)).then_some(state)
+}
+
+fn broker_running(path: &std::path::Path) -> Result<bool, std::io::Error> {
+    let lock = open_lock(path)?;
+    match lock.try_lock() {
+        Ok(()) => Ok(false),
+        Err(fs::TryLockError::WouldBlock) => Ok(true),
+        Err(fs::TryLockError::Error(error)) => Err(error),
+    }
+}
+
+fn open_lock(path: &std::path::Path) -> Result<fs::File, std::io::Error> {
+    let file = fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .create(true)
+        .truncate(false)
+        .mode(0o600)
+        .custom_flags(libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)?;
+    let metadata = file.metadata()?;
+    if !metadata.is_file() || metadata.permissions().mode() & 0o077 != 0 {
+        return Err(std::io::Error::other(
+            "broker lock must be an owner-only regular file",
+        ));
+    }
+    Ok(file)
+}
+
+fn open_directory_lock(path: &std::path::Path) -> Result<fs::File, std::io::Error> {
+    fs::OpenOptions::new()
+        .read(true)
+        .custom_flags(libc::O_DIRECTORY | libc::O_NOFOLLOW | libc::O_NONBLOCK)
+        .open(path)
+}
+
+fn encode_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|byte| format!("{byte:02x}")).collect()
+}
+
+fn random_token() -> Result<String, ring::error::Unspecified> {
+    let mut bytes = [0; 32];
+    SystemRandom::new().fill(&mut bytes)?;
+    Ok(encode_hex(&bytes))
+}
+
+fn is_token(value: &str) -> bool {
+    value.len() == 64
+        && value
+            .bytes()
+            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
 }
 
 fn accounts_command(mut args: impl Iterator<Item = String>) -> Result<(), Box<dyn Error>> {
@@ -370,8 +522,8 @@ async fn status_command() -> Result<(), Box<dyn Error>> {
 fn config_command() -> Result<(), Box<dyn Error>> {
     println!("accounts: {}", config::accounts_path()?.display());
     println!("cache: {}", config::cache_path()?.display());
-    println!("token: {}", config::token_path()?.display());
-    println!("listen: 127.0.0.1:{PORT}");
+    println!("runtime: {}", config::runtime_path()?.display());
+    println!("listen: dynamic loopback port");
     Ok(())
 }
 
@@ -387,7 +539,7 @@ fn reject_extra_args(
 
 fn print_help() {
     println!(
-        "context7-account-broker\n\nCommands:\n  start                 Start or reuse the shared broker and print plugin connection JSON\n  serve                 Run the Streamable HTTP MCP server (default)\n  accounts list         List configured accounts\n  accounts add NAME     Add an account and prompt for its API key\n  accounts remove NAME  Remove an account\n  status                Probe each account quota\n  config                Print effective configuration\n  help                  Show this help"
+        "context7-account-broker\n\nCommands:\n  start                 Start or reuse the shared broker and print plugin connection JSON (default)\n  accounts list         List configured accounts\n  accounts add NAME     Add an account and prompt for its API key\n  accounts remove NAME  Remove an account\n  status                Probe each account quota\n  config                Print effective configuration\n  help                  Show this help"
     );
 }
 
@@ -468,7 +620,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn health_requires_the_broker_token() {
+    async fn health_requires_the_token_and_discovers_the_port() {
         let directory = tempfile::tempdir().unwrap();
         let context7 = Context7::with_sender(|_, _| async {
             Err(context7::Error::Network("unused".to_owned()))
@@ -483,17 +635,38 @@ mod tests {
         )
         .unwrap();
         let cancellation = CancellationToken::new();
-        let app = application(
-            broker,
-            HeaderValue::from_static("Bearer test-token"),
-            cancellation,
-        );
+        let token = "0".repeat(64);
+        let app = application(broker, &token, cancellation);
         let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
-        let url = format!("http://{}/health", listener.local_addr().unwrap());
+        let port = listener.local_addr().unwrap().port();
+        let url = format!("http://127.0.0.1:{port}/health");
         let server = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
         let client = Client::builder().timeout(HEALTH_TIMEOUT).build().unwrap();
-        assert!(!broker_healthy(&client, &url, "wrong").await);
-        assert!(broker_healthy(&client, &url, "test-token").await);
+        assert_eq!(
+            client
+                .get(url.replace("/health", "/mcp"))
+                .send()
+                .await
+                .unwrap()
+                .status(),
+            StatusCode::UNAUTHORIZED
+        );
+        assert!(!broker_healthy(&client, port, "wrong").await);
+        assert!(broker_healthy(&client, port, &token).await);
+        let runtime_path = directory.path().join("runtime");
+        let state_path = runtime_path.join("broker.json");
+        let state = ServerState { port, token };
+        config::write_private(&state_path, &serde_json::to_vec(&state).unwrap()).unwrap();
+        assert_eq!(active_launch(&client, &state_path).await, Some(state));
+        let lock_path = runtime_path.join("broker.lock");
+        assert!(!broker_running(&lock_path).unwrap());
+        let lock = fs::OpenOptions::new()
+            .read(true)
+            .write(true)
+            .open(&lock_path)
+            .unwrap();
+        lock.lock().unwrap();
+        assert!(broker_running(&lock_path).unwrap());
         server.abort();
         let _ = server.await;
     }

@@ -1,5 +1,4 @@
 import type { Plugin, PluginModule } from "@opencode-ai/plugin";
-import { readFile } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 
 const BINARY = fileURLToPath(new URL("../vendor/context7-account-broker", import.meta.url));
@@ -7,7 +6,7 @@ const MCP_NAME = "context7-broker";
 
 type NativeLaunch = {
 	url: string;
-	tokenFile: string;
+	token: string;
 };
 
 export function parseNativeLaunch(stdout: string): NativeLaunch {
@@ -16,11 +15,13 @@ export function parseNativeLaunch(stdout: string): NativeLaunch {
 		throw new Error("context7-account-broker start returned invalid output");
 	}
 	const launch = value as Record<string, unknown>;
+	const port = typeof launch.url === "string" ? /^http:\/\/127\.0\.0\.1:([1-9]\d{0,4})\/mcp$/.exec(launch.url)?.[1] : undefined;
 	if (
-		Object.keys(launch).sort().join(",") !== "tokenFile,url" ||
-		launch.url !== "http://127.0.0.1:14197/mcp" ||
-		typeof launch.tokenFile !== "string" ||
-		!launch.tokenFile.startsWith("/")
+		Object.keys(launch).sort().join(",") !== "token,url" ||
+		!port ||
+		Number(port) > 65_535 ||
+		typeof launch.token !== "string" ||
+		!/^[0-9a-f]{64}$/.test(launch.token)
 	) {
 		throw new Error("context7-account-broker start returned invalid output");
 	}
@@ -38,10 +39,6 @@ export const server: Plugin = async ({ $ }) => ({
 			throw new Error(`context7-account-broker start failed with exit code ${result.exitCode}${stderr ? `: ${stderr}` : ""}`);
 		}
 		const launch = parseNativeLaunch(String(result.stdout));
-		const token = (await readFile(launch.tokenFile, "utf8")).trim();
-		if (!/^[0-9a-f]{64}$/.test(token)) {
-			throw new Error("context7-account-broker server token is invalid");
-		}
 		config.mcp ??= {};
 		config.mcp[MCP_NAME] = {
 			type: "remote",
@@ -49,7 +46,7 @@ export const server: Plugin = async ({ $ }) => ({
 			oauth: false,
 			timeout: 30_000,
 			headers: {
-				Authorization: `Bearer ${token}`,
+				Authorization: `Bearer ${launch.token}`,
 			},
 		};
 	},

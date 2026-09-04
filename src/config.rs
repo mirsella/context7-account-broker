@@ -3,7 +3,7 @@ use std::collections::HashSet;
 use std::env;
 use std::ffi::OsString;
 use std::fs::{self, DirBuilder, OpenOptions};
-use std::io::{self, Read, Write};
+use std::io::{self, Write};
 use std::os::unix::fs::{DirBuilderExt, OpenOptionsExt, PermissionsExt};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
@@ -29,14 +29,18 @@ pub(crate) fn accounts_path() -> io::Result<PathBuf> {
 }
 
 pub(crate) fn cache_path() -> io::Result<PathBuf> {
-    Ok(home_path(&|name| env::var_os(name), "XDG_CACHE_HOME", ".cache")?.join(APP_DIR))
+    Ok(
+        home_path(&|name| env::var_os(name), "XDG_CACHE_HOME", ".cache")?
+            .join(APP_DIR)
+            .join(env!("CARGO_PKG_VERSION")),
+    )
 }
 
-pub(crate) fn token_path() -> io::Result<PathBuf> {
+pub(crate) fn runtime_path() -> io::Result<PathBuf> {
     Ok(
         home_path(&|name| env::var_os(name), "XDG_CONFIG_HOME", ".config")?
             .join(APP_DIR)
-            .join("server-token"),
+            .join(env!("CARGO_PKG_VERSION")),
     )
 }
 
@@ -61,57 +65,6 @@ pub(crate) fn remove_account(path: &Path, name: &str) -> io::Result<()> {
         return Err(io::Error::other(format!("account {name:?} not found")));
     }
     write_accounts(path, &accounts)
-}
-
-pub(crate) fn read_server_token(path: &Path) -> io::Result<String> {
-    ensure_parent(path)?;
-    ensure_private_file(path, "server token file")?;
-    let token = fs::read_to_string(path)?.trim().to_owned();
-    if token.len() != 64
-        || !token
-            .bytes()
-            .all(|byte| byte.is_ascii_digit() || matches!(byte, b'a'..=b'f'))
-    {
-        return Err(io::Error::other(
-            "server token must contain 64 lowercase hexadecimal characters",
-        ));
-    }
-    Ok(token)
-}
-
-pub(crate) fn ensure_server_token(path: &Path) -> io::Result<String> {
-    let parent = ensure_parent(path)?;
-    match fs::symlink_metadata(path) {
-        Ok(_) => return read_server_token(path),
-        Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-        Err(error) => return Err(error),
-    }
-
-    let mut random = [0_u8; 32];
-    fs::File::open("/dev/urandom")?.read_exact(&mut random)?;
-    let token: String = random.iter().map(|byte| format!("{byte:02x}")).collect();
-    let (temporary, mut file) = private_temp(path, parent)?;
-    let installed = (|| {
-        file.write_all(token.as_bytes())?;
-        file.write_all(b"\n")?;
-        file.sync_all()?;
-        match fs::hard_link(&temporary, path) {
-            Ok(()) => {
-                fs::remove_file(&temporary)?;
-                fs::File::open(parent)?.sync_all()?;
-                Ok(token)
-            }
-            Err(error) if error.kind() == io::ErrorKind::AlreadyExists => {
-                fs::remove_file(&temporary)?;
-                read_server_token(path)
-            }
-            Err(error) => Err(error),
-        }
-    })();
-    if installed.is_err() {
-        let _ = fs::remove_file(temporary);
-    }
-    installed
 }
 
 pub(crate) fn ensure_private_directory(path: &Path) -> io::Result<()> {
@@ -330,6 +283,21 @@ mod tests {
     }
 
     #[test]
+    fn isolates_runtime_state_by_package_version() {
+        let version = env!("CARGO_PKG_VERSION");
+        assert!(
+            cache_path()
+                .unwrap()
+                .ends_with(Path::new(APP_DIR).join(version))
+        );
+        assert!(
+            runtime_path()
+                .unwrap()
+                .ends_with(Path::new(APP_DIR).join(version))
+        );
+    }
+
+    #[test]
     fn rejects_insecure_directory_without_changing_it() {
         let directory = tempfile::tempdir().unwrap();
         let path = directory.path().join("insecure");
@@ -362,28 +330,5 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(value["version"], 1);
         assert_eq!(value["accounts"][0]["apiKey"], "ctx7sk-key");
-    }
-
-    #[test]
-    fn concurrent_token_creation_converges() {
-        let directory = tempfile::tempdir().unwrap();
-        let path = std::sync::Arc::new(directory.path().join("private/server-token"));
-        let threads: Vec<_> = (0..8)
-            .map(|_| {
-                let path = path.clone();
-                std::thread::spawn(move || ensure_server_token(&path).unwrap())
-            })
-            .collect();
-        let tokens: Vec<_> = threads
-            .into_iter()
-            .map(|thread| thread.join().unwrap())
-            .collect();
-        assert_eq!(tokens.iter().collect::<HashSet<_>>().len(), 1);
-        assert_eq!(tokens[0].len(), 64);
-        assert_eq!(read_server_token(&path).unwrap(), tokens[0]);
-        assert_eq!(
-            fs::metadata(&*path).unwrap().permissions().mode() & 0o777,
-            0o600
-        );
     }
 }
