@@ -1,6 +1,7 @@
 mod broker;
 mod config;
 mod context7;
+mod mcp;
 
 use axum::Router;
 use axum::body::Body;
@@ -15,7 +16,7 @@ use reqwest::Client;
 use ring::hmac;
 use ring::rand::{SecureRandom, SystemRandom};
 use rmcp::handler::server::wrapper::Parameters;
-use rmcp::model::CallToolResult;
+use rmcp::model::{CallToolResult, Implementation, ServerCapabilities, ServerInfo};
 use rmcp::schemars;
 use rmcp::transport::streamable_http_server::session::never::NeverSessionManager;
 use rmcp::transport::streamable_http_server::tower::{
@@ -129,11 +130,21 @@ impl McpHandler {
     }
 }
 
-#[tool_handler(
-    name = "context7-account-broker",
-    instructions = "Use resolve-library-id to find a Context7-compatible library ID, then use query-docs with that ID."
-)]
-impl ServerHandler for McpHandler {}
+#[tool_handler]
+impl ServerHandler for McpHandler {
+    fn get_info(&self) -> ServerInfo {
+        mcp_info()
+    }
+}
+
+fn mcp_info() -> ServerInfo {
+    ServerInfo::new(ServerCapabilities::builder().enable_tools().build())
+        .with_server_info(Implementation::new(
+            "context7-account-broker",
+            env!("CARGO_PKG_VERSION"),
+        ))
+        .with_instructions("Use resolve-library-id to find a Context7-compatible library ID, then use query-docs with that ID.")
+}
 
 async fn authenticate(
     State(expected): State<HeaderValue>,
@@ -173,7 +184,19 @@ async fn main() -> Result<(), Box<dyn Error>> {
     match args.next().as_deref() {
         None | Some("start") => {
             reject_extra_args(&mut args, "start")?;
-            start().await
+            let state = start().await?;
+            println!(
+                "{}",
+                serde_json::to_string(&StartOutput {
+                    url: format!("http://127.0.0.1:{}/mcp", state.port),
+                    token: state.token,
+                })?
+            );
+            Ok(())
+        }
+        Some("mcp") => {
+            reject_extra_args(&mut args, "mcp")?;
+            mcp::run(start().await?).await
         }
         Some("__serve") => {
             reject_extra_args(&mut args, "__serve")?;
@@ -276,12 +299,13 @@ fn application(broker: Arc<Broker>, token: &str, cancellation: CancellationToken
         .with_state(health_key)
 }
 
-async fn start() -> Result<(), Box<dyn Error>> {
+async fn start() -> Result<ServerState, Box<dyn Error>> {
     let runtime_path = config::runtime_path()?;
     config::ensure_private_directory(&runtime_path)?;
     let runtime_path = fs::canonicalize(runtime_path)?;
     let client = Client::builder()
         .timeout(HEALTH_TIMEOUT)
+        .no_proxy()
         .redirect(reqwest::redirect::Policy::none())
         .build()?;
     let state_path = runtime_path.join("broker.json");
@@ -298,23 +322,12 @@ async fn start() -> Result<(), Box<dyn Error>> {
             Err(fs::TryLockError::Error(error)) => return Err(error.into()),
         }
     }
-    let print_launch = |state: ServerState| -> Result<(), Box<dyn Error>> {
-        println!(
-            "{}",
-            serde_json::to_string(&StartOutput {
-                url: format!("http://127.0.0.1:{}/mcp", state.port),
-                token: state.token,
-            })?
-        );
-        Ok(())
-    };
     loop {
         if !broker_running(&broker_lock_path)? {
             break;
         }
         if let Some(state) = active_launch(&client, &state_path).await {
-            print_launch(state)?;
-            return Ok(());
+            return Ok(state);
         }
         if tokio::time::Instant::now() >= deadline {
             return Err("broker startup timed out".into());
@@ -345,8 +358,7 @@ async fn start() -> Result<(), Box<dyn Error>> {
             return Err(startup_error(&log_path, format!("child exited with {status}")).into());
         }
         if let Some(state) = active_launch(&client, &state_path).await {
-            print_launch(state)?;
-            return Ok(());
+            return Ok(state);
         }
         if tokio::time::Instant::now() >= deadline {
             let _ = child.kill();
@@ -539,7 +551,7 @@ fn reject_extra_args(
 
 fn print_help() {
     println!(
-        "context7-account-broker\n\nCommands:\n  start                 Start or reuse the shared broker and print plugin connection JSON (default)\n  accounts list         List configured accounts\n  accounts add NAME     Add an account and prompt for its API key\n  accounts remove NAME  Remove an account\n  status                Probe each account quota\n  config                Print effective configuration\n  help                  Show this help"
+        "context7-account-broker\n\nCommands:\n  mcp                   Serve MCP over stdio using the shared broker\n  start                 Start or reuse the broker and print HTTP connection JSON (default)\n  accounts list         List configured accounts\n  accounts add NAME     Add an account and prompt for its API key\n  accounts remove NAME  Remove an account\n  status                Probe each account quota\n  config                Print effective configuration\n  help                  Show this help"
     );
 }
 

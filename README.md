@@ -1,6 +1,6 @@
 # context7-account-broker
 
-An OpenCode plugin that runs one local Context7 MCP broker across projects and shares quota, caching, affinity, and in-flight requests across configured API keys.
+A Context7 MCP server that shares accounts, quota routing, caching, affinity, and in-flight requests across projects and coding agents. Use its native stdio command with any MCP client, or its OpenCode plugin for automatic registration.
 
 > [!IMPORTANT]
 > This package supports Linux x86-64 only. macOS, Windows, Linux ARM64, and other platforms are not supported.
@@ -10,12 +10,40 @@ An OpenCode plugin that runs one local Context7 MCP broker across projects and s
 Add at least one Context7 account:
 
 ```sh
-bunx @mirsella/context7-account-broker accounts add personal
+context7-account-broker accounts add personal
 ```
 
 The command reads the API key from a hidden terminal prompt and stores it in a private `accounts.json` file.
 
-Then add the plugin to `opencode.json`:
+### Any MCP client
+
+Configure a local stdio server with command `context7-account-broker` and arguments `["mcp"]`. For clients that use `mcpServers`:
+
+```json
+{
+  "mcpServers": {
+    "context7-broker": {
+      "command": "context7-account-broker",
+      "args": ["mcp"]
+    }
+  }
+}
+```
+
+Codex uses the same command:
+
+```toml
+[mcp_servers.context7-broker]
+command = "context7-account-broker"
+args = ["mcp"]
+tool_timeout_sec = 30
+```
+
+The command starts or reuses the shared broker. It speaks MCP on stdin/stdout; diagnostics go to stderr. Accounts and server tokens stay outside the client's configuration.
+
+### OpenCode
+
+Add the plugin to `opencode.json`:
 
 ```json
 {
@@ -27,15 +55,17 @@ That is the complete OpenCode configuration. Do not add an `mcp.context7-broker`
 
 ## Lifecycle
 
-When OpenCode loads the plugin, the packaged Linux x64 binary runs `start`. It creates private runtime state for that package version, reuses its matching healthy broker, or launches one on an available loopback port. Each broker process gets a fresh token, which `start` returns directly to the plugin for OpenCode's in-memory MCP configuration. The token is never written to `opencode.json` or passed in process arguments.
+Each `mcp` process starts or reuses a healthy broker for its package version, then connects to its authenticated loopback HTTP endpoint. The native command handles authentication internally. The OpenCode plugin registers this same stdio command.
 
-OpenCode processes using the same plugin version share one broker. Separate OpenCode processes can use different plugin versions at the same time because each version has its own port, token, cache, and broker process. A broker stays available across project and session lifetimes; its containing process manager may stop it with OpenCode. There is no supervisor, heartbeat, separate systemd unit, PATH installation, manual token, or last-client shutdown.
+Clients using the same version and XDG configuration/cache directories share the broker and its state. Different versions use separate ports, tokens, and caches. Disconnecting a client closes its stdio transport; the shared broker remains available. A containing process manager may stop it with the harness. No separate service setup is needed.
 
+The `start` command remains available for direct HTTP clients and prints connection JSON. Keep that output private: it includes the broker token.
 Startup makes no Context7 requests. Context7 is contacted only for tool calls and the explicit `status` command.
 
 ## Commands
 
 ```text
+context7-account-broker mcp
 context7-account-broker start
 context7-account-broker accounts list
 context7-account-broker accounts add NAME
@@ -56,7 +86,7 @@ The command prints each account's used and total requests, percentage used, bloc
 
 ## Architecture
 
-The plugin contains a static `x86_64-unknown-linux-musl` binary. Each active package version runs one current-thread Tokio process exposing authenticated Streamable HTTP MCP on an OS-assigned loopback port. It forwards requests directly to the official Context7 REST API with bounded concurrency four.
+The npm package contains a static `x86_64-unknown-linux-musl` binary. Each active version runs one current-thread Tokio broker exposing authenticated Streamable HTTP MCP on an OS-assigned loopback port. Each client runs a stdio process backed by the Rust MCP SDK. Requests can overlap; the shared broker limits upstream Context7 REST API calls to four at a time.
 
 The broker provides the canonical `resolve-library-id` and `query-docs` tools. It routes toward account affinity and lower quota use, rotates unknown quota fairly, fails over account-specific `401`, `402`, `403`, and `429` responses, and caps shared endpoint failures at two attempts. Successful results use an account-partitioned disk cache. Identical typed requests share one cancellation-safe in-flight producer.
 
@@ -65,6 +95,15 @@ Default private state:
 - Accounts: `${XDG_CONFIG_HOME:-$HOME/.config}/context7-account-broker/accounts.json`
 - Broker state: `${XDG_CONFIG_HOME:-$HOME/.config}/context7-account-broker/<version>/broker.json`
 - Cache and log: `${XDG_CACHE_HOME:-$HOME/.cache}/context7-account-broker/<version>/`
+
+## Development and Nix
+
+The Rust source owns both transports, startup, account-file handling, and tests. `nix/package.nix` builds the native command from this repository's `Cargo.lock` and wraps its CA bundle. Consumers can call that expression with their own Nixpkgs; no external source patches or transport wrappers are needed.
+
+```sh
+cargo test --locked
+bun test tests/plugin.test.ts
+```
 
 ## License
 

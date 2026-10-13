@@ -661,7 +661,13 @@ mod tests {
         let task = tokio::spawn(async move { task_broker.call(request("q")).await });
         tokio::time::sleep(Duration::from_millis(5)).await;
         task.abort();
-        tokio::time::sleep(Duration::from_millis(40)).await;
+        tokio::time::timeout(Duration::from_secs(5), async {
+            while !broker.inflight.lock().unwrap().is_empty() {
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .expect("canceled waiter's producer must finish and clear its in-flight entry");
         assert!(broker.inflight.lock().unwrap().is_empty());
         broker.call(request("q")).await;
         assert_eq!(calls.load(AtomicOrdering::SeqCst), 1);

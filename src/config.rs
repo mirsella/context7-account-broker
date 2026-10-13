@@ -143,7 +143,7 @@ fn load_configured_accounts(path: &Path) -> io::Result<Vec<AccountRecord>> {
     match fs::symlink_metadata(path) {
         Err(error) if error.kind() == io::ErrorKind::NotFound => return Ok(Vec::new()),
         Err(error) => return Err(error),
-        Ok(_) => ensure_private_file(path, "accounts file")?,
+        Ok(_) => ensure_private_file(&fs::canonicalize(path)?, "accounts file")?,
     }
     let file: AccountsFile = serde_json::from_slice(&fs::read(path)?).map_err(io::Error::other)?;
     if file.version != 1 {
@@ -330,5 +330,24 @@ mod tests {
         let value: serde_json::Value = serde_json::from_slice(&fs::read(path).unwrap()).unwrap();
         assert_eq!(value["version"], 1);
         assert_eq!(value["accounts"][0]["apiKey"], "ctx7sk-key");
+    }
+
+    #[test]
+    fn loads_private_accounts_through_a_secret_symlink() {
+        use std::os::unix::fs::symlink;
+
+        let directory = tempfile::tempdir().unwrap();
+        fs::set_permissions(directory.path(), fs::Permissions::from_mode(0o700)).unwrap();
+        let secret = directory.path().join("secret");
+        write_private(
+            &secret,
+            br#"{"version":1,"accounts":[{"name":"personal","apiKey":"ctx7sk-test"}]}"#,
+        )
+        .unwrap();
+        let link = directory.path().join("accounts.json");
+        symlink(&secret, &link).unwrap();
+        assert_eq!(load_accounts(&link).unwrap()[0].name, "personal");
+        fs::set_permissions(&secret, fs::Permissions::from_mode(0o644)).unwrap();
+        assert!(load_accounts(&link).is_err());
     }
 }
